@@ -8,6 +8,7 @@ import json
 import requests
 from generator import leer_oferta_economica, leer_base_datos_apu, generate_apu_excel
 from bases_externas import cargar_base_externa
+from salarios import años_disponibles, jornal_minimo, smmlv_vigente, info_año
 
 st.set_page_config(page_title="Generador de APUs – GLI", page_icon="🏗️", layout="wide")
 
@@ -23,6 +24,32 @@ st.markdown("""
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("⚙️ Configuración")
+
+    # ── Año del proceso / SMMLV ───────────────────────────────────────────────
+    st.subheader("📅 Año del proceso")
+    año_opciones = años_disponibles()
+    import datetime
+    año_default_idx = año_opciones.index(datetime.date.today().year) \
+        if datetime.date.today().year in año_opciones else 0
+    año_manual = st.selectbox(
+        "Año vigente del proceso",
+        options=[None] + año_opciones,
+        index=0,
+        format_func=lambda x: "🔍 Auto-detectar" if x is None else str(x),
+    )
+    if año_manual:
+        datos = info_año(año_manual)
+        st.info(
+            f"**SMMLV {año_manual}:** ${datos['smmlv']:,}\n\n"
+            f"**Jornal mín. legal:** ${datos['jornal_minimo']:,.0f}/día\n\n"
+            f"_(Base: SMMLV / {datos['dias_mes']} días × {datos['factor']}x prestacional)_"
+        )
+    else:
+        st.caption("El sistema detectará el año del proceso automáticamente desde la lista de insumos o el archivo Excel.")
+
+    st.divider()
+
+    # ── AIU ───────────────────────────────────────────────────────────────────
     include_aiu = st.toggle("Incluir AIU en los APUs", value=False)
     aiu_pct = 0.0
     if include_aiu:
@@ -31,9 +58,10 @@ with st.sidebar:
         st.info(f"AIU: **{val:.2f}%**")
     else:
         st.success("Sin AIU — precio = costo directo")
+
     st.divider()
     st.markdown("⚠️ Use descripciones **genéricas** (sin marcas comerciales).")
-    st.caption("v9.0 · GLI Colombia · 2026")
+    st.caption("v10.0 · GLI Colombia · 2026")
 
 # ── Paso 1: Archivo del proceso ───────────────────────────────────────────────
 st.subheader("1. Cargue el Excel de la oferta económica del proceso")
@@ -97,7 +125,11 @@ if uploaded_bases:
 
 # ── Leer proceso ──────────────────────────────────────────────────────────────
 with st.spinner("Leyendo el archivo del proceso..."):
-    resultado, error = leer_oferta_economica(uploaded_proceso, bd_referencia=bd_referencia)
+    resultado, error = leer_oferta_economica(
+        uploaded_proceso,
+        bd_referencia=bd_referencia,
+        año_proceso=año_manual,
+    )
 
 if error:
     st.error(f"❌ {error}")
@@ -107,6 +139,81 @@ con_apu = resultado['items_con_apu']
 sin_apu = resultado['items_sin_apu']
 n_total = resultado['total_proceso']
 hoja    = resultado['hoja_usada']
+año_proc       = resultado['año_proceso']
+año_fuente     = resultado['año_fuente']
+jornal_min     = resultado['jornal_min_legal']
+alertas        = resultado['alertas']
+
+# ── Año detectado y SMMLV ─────────────────────────────────────────────────────
+st.info(f"📅 **Año del proceso detectado: {año_proc}** — {año_fuente}")
+
+# ── Panel de validaciones críticas ───────────────────────────────────────────
+alertas_supera   = alertas['supera_entidad']
+alertas_negativa = alertas['zona_negativa']
+alertas_rend     = alertas['rendimiento_alto']
+alertas_jornal   = alertas['jornal_bajo']
+
+if alertas_supera:
+    with st.expander(
+        f"🔴 **ALERTA CRÍTICA: {len(alertas_supera)} ítem(s) superan el APU de la entidad** — expandir para ver",
+        expanded=True
+    ):
+        st.error(
+            "Los siguientes ítems tienen un precio ofertado **MAYOR** al APU oficial de la entidad. "
+            "Esto no es aceptable en una propuesta licitatoria. Revise su oferta económica antes de continuar."
+        )
+        data_sup = []
+        for it in alertas_supera:
+            data_sup.append({
+                "Ítem": it['code'],
+                "Descripción": it['description'][:60],
+                "Precio ofertado": f"${it['valor_ofrecido']:,.0f}",
+                "APU entidad": f"${it['apu_entidad_total']:,.0f}",
+                "Exceso": f"${it['valor_ofrecido'] - it['apu_entidad_total']:,.0f}",
+            })
+        st.dataframe(data_sup, use_container_width=True)
+
+if alertas_negativa:
+    with st.expander(
+        f"🔴 **{len(alertas_negativa)} ítem(s) en zona negativa** — costos fijos superan el precio ofertado",
+        expanded=True
+    ):
+        st.warning(
+            "En estos ítems, la suma de materiales + equipos + transporte (valores fijos del APU oficial) "
+            "ya supera su precio ofertado. No hay margen para mano de obra. "
+            "**Requieren justificación documental** (cotizaciones, fichas técnicas de eficiencia)."
+        )
+        data_neg = []
+        for it in alertas_negativa:
+            data_neg.append({
+                "Ítem": it['code'],
+                "Descripción": it['description'][:60],
+                "Precio ofertado": f"${it['valor_ofrecido']:,.0f}",
+                "Labor residual": f"${it.get('labor_residual', 0):,.0f}",
+            })
+        st.dataframe(data_neg, use_container_width=True)
+
+if alertas_rend:
+    with st.expander(
+        f"⚠️ **{len(alertas_rend)} ítem(s) con rendimiento MO muy alto** (precio bajo para ese ítem)"
+    ):
+        st.warning(
+            "El rendimiento calculado de mano de obra es mayor a 5.0x el rendimiento de referencia. "
+            "Requieren acreditar rendimientos extraordinarios con registros de obra."
+        )
+        for it in alertas_rend:
+            st.markdown(f"- **`{it['code']}`** — {it['description'][:55]} | Factor MO: **{it.get('factor_mo', '?')}x**")
+
+if alertas_jornal:
+    with st.expander(f"⚠️ **{len(alertas_jornal)} ítem(s)** con jornales ajustados al mínimo legal"):
+        st.info(
+            f"El APU de referencia traía jornales inferiores al mínimo legal {año_proc} "
+            f"(${jornal_min:,.0f}/día). Se ajustaron automáticamente al mínimo."
+        )
+
+if not (alertas_supera or alertas_negativa or alertas_rend or alertas_jornal):
+    if con_apu:
+        st.success(f"✅ Todas las validaciones pasaron. {len(con_apu)} APU(s) listos con algoritmo R2.")
 
 # ── Resumen ───────────────────────────────────────────────────────────────────
 st.subheader("4. Resumen")
@@ -139,6 +246,8 @@ if sin_apu:
         ok_count = 0
         err_count = 0
         items_generados = []
+        jornal_min = resultado.get('jornal_min_legal', jornal_minimo(resultado.get('año_proceso', 2026)))
+        año_proc   = resultado.get('año_proceso', 2026)
 
         for idx, item in enumerate(sin_apu):
             pct = idx / len(sin_apu)
@@ -147,22 +256,28 @@ if sin_apu:
             precio_total = int(round(item['valor_ofrecido'], 0))
 
             prompt = f"""Eres un ingeniero civil colombiano experto en presupuestos de obra pública.
-Desagrega el siguiente ítem en sus componentes de COSTO DIRECTO.
+Desagrega el siguiente ítem en sus componentes de COSTO DIRECTO para una propuesta licitatoria colombiana.
 
 ÍTEM: {item['description']}
 UNIDAD DE MEDIDA: {item['unit']}
-PRECIO UNITARIO: ${precio_total:,} COP
+PRECIO UNITARIO OFERTADO: ${precio_total:,} COP
+AÑO DEL PROCESO: {año_proc}
+JORNAL MÍNIMO LEGAL {año_proc}: ${jornal_min:,.0f} COP/día (SMMLV/{jornal_min:.0f} × factor 1.5 prestacional)
 
 REGLAS OBLIGATORIAS:
 1. Descripciones GENÉRICAS sin marcas comerciales.
-2. La suma exacta de (rend × unit_price) de TODOS los componentes debe ser {precio_total}.
+2. La suma exacta de (rend × unit_price) de TODOS los componentes debe ser exactamente {precio_total}.
 3. Clasifica cada componente en: materiales, herramientas, mano_de_obra o transporte.
-4. Unidades colombianas: M3, M2, ML, KG, GL, UND, HR, DIA, M3-KM, TON.
-5. Rendimientos coherentes con la unidad del ítem ({item['unit']}).
-6. Mínimo 2 componentes, máximo 8.
+4. Unidades colombianas: M3, M2, ML, KG, GL, UND, HR, DIA, TON.
+5. CRÍTICO — Mano de obra: unit_price NUNCA puede ser inferior a ${jornal_min:,.0f} COP/día.
+   Este es el mínimo legal {año_proc}. Si el precio ofertado no permite MO a ese jornal,
+   reduzca materiales o equipos pero NUNCA el jornal.
+6. Rendimientos coherentes con la unidad del ítem ({item['unit']}).
+7. Mínimo 2 componentes, máximo 8.
+8. Sin valores negativos en ningún componente.
 
 Responde ÚNICAMENTE con JSON válido sin texto adicional, sin comillas markdown:
-{{"materiales":[{{"description":"nombre genérico","unit":"und","rend":0.5,"unit_price":10000}}],"herramientas":[{{"description":"nombre","unit":"und","rend":0.1,"unit_price":5000}}],"mano_de_obra":[{{"description":"nombre","unit":"HR","rend":0.4,"unit_price":45000}}],"transporte":[]}}"""
+{{"materiales":[{{"description":"nombre genérico","unit":"und","rend":0.5,"unit_price":10000}}],"herramientas":[{{"description":"nombre","unit":"und","rend":0.1,"unit_price":5000}}],"mano_de_obra":[{{"description":"cuadrilla operario+ayudante","unit":"DIA","rend":0.4,"unit_price":{jornal_min:.0f}}}],"transporte":[]}}"""
 
             try:
                 # Obtener API key: primero de Streamlit Secrets (nube), luego de variable local
@@ -224,6 +339,11 @@ Responde ÚNICAMENTE con JSON válido sin texto adicional, sin comillas markdown
                             break
 
                 componentes = json.loads(texto)
+
+                # ── Validar jornales mínimos en componentes IA ────────────────
+                for comp in componentes.get('mano_de_obra', []):
+                    if comp.get('unit_price', 0) < jornal_min:
+                        comp['unit_price'] = jornal_min  # corregir al mínimo legal
 
                 # Ajustar para que sume exactamente el precio
                 total_comp = sum(
