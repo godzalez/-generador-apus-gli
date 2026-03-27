@@ -12,6 +12,7 @@ import io, re
 # ══════════════════════════════════════════════════════════════════
 from numero_letras import numero_a_letras
 from bases_externas import buscar_en_base, construir_apu_desde_base
+from salarios import jornal_minimo, determinar_año_proceso
 from detector import (
     detectar_columnas as _detectar_columnas_ext,
     es_fila_item_valida as _es_fila_item_valida_ext,
@@ -341,12 +342,16 @@ def leer_base_datos_apu(archivo_referencia):
 # LECTURA PRINCIPAL DEL PROCESO
 # ══════════════════════════════════════════════════════════════════
 
-def leer_oferta_economica(uploaded_file, bd_referencia=None):
+def leer_oferta_economica(uploaded_file, bd_referencia=None, año_proceso: int | None = None):
     try:
         data = uploaded_file.read()
         wb = load_workbook(io.BytesIO(data), data_only=True)
     except Exception as e:
         return None, f"No se pudo abrir el archivo: {e}"
+
+    # ── Determinar año del proceso (para validación de jornales mínimos) ──────
+    año_proc, año_fuente = determinar_año_proceso(wb=wb, año_manual=año_proceso)
+    jornal_min_legal = jornal_minimo(año_proc)
 
     ws_pres = _encontrar_hoja_presupuesto(wb)
     fila_enc, mapa = _detectar_columnas(ws_pres)
@@ -426,7 +431,7 @@ def leer_oferta_economica(uploaded_file, bd_referencia=None):
     bd_ext = bd_referencia or {}
     bd_combinada = {**bd_ext, **bd_interna}  # interna tiene prioridad
 
-    # ── Cruzar y escalar ──────────────────────────────────────────────────────
+    # ── Cruzar y aplicar algoritmo R2 ────────────────────────────────────────
     for code, item in items_proceso.items():
         apu = bd_combinada.get(code)
         if not apu:
@@ -434,25 +439,109 @@ def leer_oferta_economica(uploaded_file, bd_referencia=None):
         ref = apu['total_referencia']
         if ref <= 0:
             continue
-        factor = item['valor_ofrecido'] / ref
-        for sec in ('materiales','herramientas','transporte','mano_de_obra'):
+
+        precio_ofertado = item['valor_ofrecido']
+
+        # ── Validación R: precio ofertado NO debe superar APU entidad ─────────
+        if precio_ofertado > ref + 1:   # tolerancia $1 por redondeo
+            item['alerta_supera_entidad'] = True
+            item['apu_entidad_total']     = ref
+
+        # ── Componentes FIJOS: VU y REND inalterados ─────────────────────────
+        # Materiales, herramientas/equipos y transporte: valores exactos del APU oficial
+        for sec in ('materiales', 'herramientas', 'transporte'):
             item[sec] = [
-                {**c,
-                 'unit_price': round(c['unit_price'] * factor, 2),
-                 'parcial':    round(c['rend'] * c['unit_price'] * factor, 2)}
-                for c in apu[sec]
+                {**c, 'parcial': round(c['rend'] * c['unit_price'], 2)}
+                for c in apu.get(sec, [])
             ]
+
+        subtotal_mat   = sum(c['rend'] * c['unit_price'] for c in item['materiales'])
+        subtotal_herr  = sum(c['rend'] * c['unit_price'] for c in item['herramientas'])
+        subtotal_trans = sum(c['rend'] * c['unit_price'] for c in item['transporte'])
+        fijos_total    = subtotal_mat + subtotal_herr + subtotal_trans
+
+        # ── Labor residual: lo que queda para mano de obra ───────────────────
+        labor_residual = precio_ofertado - fijos_total
+
+        if labor_residual <= 0:
+            # R3: zona negativa — costos fijos ya superan el precio ofertado
+            item['alerta_zona_negativa'] = True
+            item['labor_residual']       = labor_residual
+            # Copiar MO de referencia sin escalar (estructura visible para el usuario)
+            item['mano_de_obra'] = [
+                {**c, 'parcial': round(c['rend'] * c['unit_price'], 2)}
+                for c in apu.get('mano_de_obra', [])
+            ]
+        else:
+            # R2: calcular nuevo rendimiento para MO — jornales FIJOS, rend varía
+            mo_ref = apu.get('mano_de_obra', [])
+            suma_mo_original = sum(c['rend'] * c['unit_price'] for c in mo_ref)
+
+            if mo_ref and suma_mo_original > 0:
+                # factor = labor_residual / coste_MO_original → escala solo el rend
+                factor_mo = labor_residual / suma_mo_original
+
+                # Señales de alerta por rendimiento (según prompt maestro)
+                if factor_mo > 5.0:
+                    item['alerta_rendimiento_alto'] = True
+                    item['factor_mo'] = round(factor_mo, 4)
+                elif factor_mo < 0.3:
+                    item['alerta_rendimiento_bajo'] = True
+                    item['factor_mo'] = round(factor_mo, 4)
+
+                # Validar que ningún jornal quede por debajo del mínimo legal
+                mo_nueva = []
+                for c in mo_ref:
+                    jornal_actual = c['unit_price']
+                    if jornal_actual < jornal_min_legal:
+                        # Ajustar jornal al mínimo y recalcular rend
+                        jornal_actual = jornal_min_legal
+                        item['alerta_jornal_bajo'] = True
+                    rend_nuevo = round(c['rend'] * factor_mo, 6)
+                    mo_nueva.append({
+                        **c,
+                        'unit_price': jornal_actual,
+                        'rend':       rend_nuevo,
+                        'parcial':    round(rend_nuevo * jornal_actual, 2),
+                    })
+                item['mano_de_obra'] = mo_nueva
+            else:
+                # Sin MO en referencia: crear componente genérico con jornal mínimo
+                item['mano_de_obra'] = [{
+                    'description': 'Cuadrilla de obra (operario + ayudante)',
+                    'unit':        'DIA',
+                    'rend':        round(labor_residual / jornal_min_legal, 6),
+                    'unit_price':  jornal_min_legal,
+                    'parcial':     round(labor_residual, 2),
+                }]
+            item['labor_residual'] = labor_residual
+
         item['tiene_apu'] = True
 
     con_apu = [i for i in items_proceso.values() if i['tiene_apu']]
     sin_apu = [i for i in items_proceso.values() if not i['tiene_apu']]
 
+    # ── Estadísticas de validación ────────────────────────────────────────────
+    supera_entidad  = [i for i in con_apu if i.get('alerta_supera_entidad')]
+    zona_negativa   = [i for i in con_apu if i.get('alerta_zona_negativa')]
+    rend_alto       = [i for i in con_apu if i.get('alerta_rendimiento_alto')]
+    jornal_bajo     = [i for i in con_apu if i.get('alerta_jornal_bajo')]
+
     return {
-        'items_con_apu':  con_apu,
-        'items_sin_apu':  sin_apu,
-        'total_proceso':  len(items_proceso),
-        'tiene_hoja_apu': bool(bd_interna),
-        'hoja_usada':     ws_pres.title,
+        'items_con_apu':       con_apu,
+        'items_sin_apu':       sin_apu,
+        'total_proceso':       len(items_proceso),
+        'tiene_hoja_apu':      bool(bd_interna),
+        'hoja_usada':          ws_pres.title,
+        'año_proceso':         año_proc,
+        'año_fuente':          año_fuente,
+        'jornal_min_legal':    jornal_min_legal,
+        'alertas': {
+            'supera_entidad':  supera_entidad,
+            'zona_negativa':   zona_negativa,
+            'rendimiento_alto': rend_alto,
+            'jornal_bajo':     jornal_bajo,
+        },
     }, None
 
 
