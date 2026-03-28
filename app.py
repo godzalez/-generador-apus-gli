@@ -1,12 +1,9 @@
 """
 Generador Automático de APUs — Gerencia Legal Integral Colombia S.A.S.
-v10: Flujo rediseñado — APUs Entidad + Propuesta Económica.
-     Motor de ajuste por rendimiento de mano de obra (Reglas Generales).
-     Bases externas desactivadas por defecto (modo avanzado).
+v11: Textos claros + AIU leído automáticamente del archivo de la entidad.
 """
 import streamlit as st
 import pandas as pd
-import io
 from generator import (
     leer_apu_entidad,
     leer_propuesta_economica,
@@ -21,7 +18,7 @@ st.markdown("""
         <h2 style='color:white;margin:0'>🏗️ Generador Automático de APUs</h2>
         <p style='color:#BDD7EE;margin:4px 0 0 0'>
         Gerencia Legal Integral Colombia S.A.S. &nbsp;·&nbsp;
-        Ajusta los APUs de la entidad a los precios de su propuesta económica.</p>
+        Ajusta los APUs de la entidad al precio de su propuesta económica.</p>
     </div>
 """, unsafe_allow_html=True)
 
@@ -29,66 +26,101 @@ st.markdown("""
 with st.sidebar:
     st.header("⚙️ Configuración")
 
-    include_aiu = st.toggle("Incluir AIU en los APUs", value=False)
-    aiu_pct = 0.0
-    if include_aiu:
-        val = st.number_input("Porcentaje AIU (%)", 0.0, 100.0, 25.0, 0.1, "%.2f")
-        aiu_pct = val / 100.0
-        st.info(f"AIU: **{val:.2f}%**")
-    else:
-        st.success("Sin AIU — precio = costo directo")
+    st.info(
+        "**AIU automático**  \n"
+        "El factor AIU se lee directamente del archivo de la entidad "
+        "(columna J de la hoja APU). No necesita ingresarlo manualmente."
+    )
 
     st.divider()
-
-    # Modo avanzado — bases externas (oculto por defecto)
-    modo_avanzado = st.toggle("🔧 Modo avanzado (bases externas)", value=False)
+    modo_avanzado = st.toggle("🔧 Modo avanzado — bases externas", value=False)
+    if modo_avanzado:
+        st.caption(
+            "Activa la carga de bases de precios externas (Gobernación, INVIAS) "
+            "para completar ítems que no estén en el archivo de la entidad."
+        )
 
     st.divider()
     st.markdown("⚠️ Use descripciones **genéricas** (sin marcas comerciales).")
-    st.caption("v10.0 · GLI Colombia · 2026")
+    st.caption("v11.0 · GLI Colombia · 2026")
 
-# ── PASO 1: APUs de la Entidad ────────────────────────────────────────────────
-st.subheader("1. APUs de la Entidad")
-st.caption(
-    "Cargue el archivo Excel que contiene los APUs del proceso de contratación "
-    "(archivo entregado por la entidad). Debe contener **todos los ítems** con sus "
-    "componentes: materiales, equipos, herramientas, transporte y mano de obra."
-)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PASO 1 — APUs de la Entidad
+# ══════════════════════════════════════════════════════════════════════════════
+st.markdown("---")
+col_icon, col_title = st.columns([0.06, 0.94])
+col_icon.markdown("## 1️⃣")
+col_title.markdown("## APUs de la Entidad")
+
+st.markdown("""
+> **¿Qué archivo cargar aquí?**  
+> El archivo Excel que **la entidad contratante le entregó** con los análisis de precios unitarios del proceso.
+> Este archivo contiene los componentes de cada ítem: materiales, equipos, mano de obra y transporte.
+> La aplicación tomará estos componentes como base y **solo ajustará el rendimiento de la mano de obra**.
+""")
+
 uploaded_entidad = st.file_uploader(
-    "Excel con APUs de la Entidad",
-    type=["xlsx", "xlsm"], key="entidad"
+    "📂 Seleccione el archivo de APUs de la Entidad",
+    type=["xlsx", "xlsm"],
+    key="entidad",
+    help="Archivo Excel entregado por la entidad con la hoja APU y sus componentes."
 )
 
-# ── PASO 2: Mi Propuesta Económica ────────────────────────────────────────────
-st.subheader("2. Mi Propuesta Económica")
-st.caption(
-    "Cargue el archivo Excel con los precios que usted va a ofrecer. "
-    "El sistema cruzará ítem por ítem y ajustará el rendimiento de la mano de obra "
-    "para que cada APU cierre exactamente con su precio ofrecido (a 2 decimales)."
-)
+if uploaded_entidad:
+    st.success(f"✅ Archivo cargado: **{uploaded_entidad.name}**")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PASO 2 — Mi Propuesta Económica
+# ══════════════════════════════════════════════════════════════════════════════
+st.markdown("---")
+col_icon, col_title = st.columns([0.06, 0.94])
+col_icon.markdown("## 2️⃣")
+col_title.markdown("## Mi Propuesta Económica")
+
+st.markdown("""
+> **¿Qué archivo cargar aquí?**  
+> El formulario o presupuesto con **los precios que usted va a ofrecer** en el proceso.
+> Puede ser el formulario de la entidad diligenciado con sus precios, o su propio presupuesto.
+> La aplicación tomará el precio unitario de cada ítem y ajustará el rendimiento de mano de obra
+> para que el APU cierre **exactamente** con ese valor (a dos decimales).
+""")
+
 uploaded_propuesta = st.file_uploader(
-    "Excel con su Propuesta Económica (PRESUPUESTO, PROPUESTA, FORMULARIO, etc.)",
-    type=["xlsx", "xlsm"], key="propuesta"
+    "📂 Seleccione el archivo con su Propuesta Económica",
+    type=["xlsx", "xlsm"],
+    key="propuesta",
+    help="Su formulario de oferta económica con los precios unitarios que va a proponer."
 )
 
-if not uploaded_entidad or not uploaded_propuesta:
-    pasos = []
-    if not uploaded_entidad:   pasos.append("APUs de la Entidad")
-    if not uploaded_propuesta: pasos.append("Propuesta Económica")
-    st.info(f"👆 Cargue: **{' y '.join(pasos)}** para continuar.")
-    st.stop()
+if uploaded_propuesta:
+    st.success(f"✅ Archivo cargado: **{uploaded_propuesta.name}**")
 
-# ── PASO 3 (Modo avanzado): Bases externas ────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PASO 3 (Modo avanzado) — Bases externas
+# ══════════════════════════════════════════════════════════════════════════════
 bds_externas = []
 if modo_avanzado:
-    st.subheader("3. Bases de precios externas (avanzado)")
-    st.caption(
-        "Opcional. Solo para ítems que no tengan APU en el archivo de la entidad. "
-        "Puede cargar bases de Gobernación de Boyacá, INVIAS u otras."
-    )
+    st.markdown("---")
+    col_icon, col_title = st.columns([0.06, 0.94])
+    col_icon.markdown("## 3️⃣")
+    col_title.markdown("## Bases de Precios Externas *(opcional)*")
+
+    st.markdown("""
+    > **¿Para qué sirve esto?**  
+    > Si algunos ítems de su propuesta **no están en el archivo de la entidad**, puede cargar
+    > bases de precios de Gobernación de Boyacá, INVIAS u otras entidades para completarlos.
+    > Si no carga nada aquí, esos ítems quedarán en rojo para completar manualmente.
+    """)
+
     uploaded_bases = st.file_uploader(
-        "Bases de precios externas",
-        type=["xlsx", "xlsm"], key="bases_ext", accept_multiple_files=True
+        "📂 Seleccione bases de precios externas (puede cargar varios archivos)",
+        type=["xlsx", "xlsm"],
+        key="bases_ext",
+        accept_multiple_files=True,
+        help="Bases de precios de Gobernación, INVIAS u otras entidades de referencia."
     )
     if uploaded_bases:
         from bases_externas import cargar_base_externa
@@ -98,32 +130,58 @@ if modo_avanzado:
             )
             if bd_ext:
                 bds_externas.append(bd_ext)
-                st.success(f"✅ **{ub.name}**: {len(bd_ext)} ítems ({fmt_ext})")
+                st.success(f"✅ **{ub.name}**: {len(bd_ext)} ítems cargados ({fmt_ext})")
             else:
                 st.warning(f"⚠️ {ub.name}: {err_ext}")
 
-# ── Procesar archivos ─────────────────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Validación de archivos
+# ══════════════════════════════════════════════════════════════════════════════
+if not uploaded_entidad or not uploaded_propuesta:
+    st.markdown("---")
+    faltantes = []
+    if not uploaded_entidad:   faltantes.append("**APUs de la Entidad** (Paso 1)")
+    if not uploaded_propuesta: faltantes.append("**Propuesta Económica** (Paso 2)")
+    st.info(f"👆 Para continuar, cargue: {' y '.join(faltantes)}.")
+    st.stop()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Procesamiento
+# ══════════════════════════════════════════════════════════════════════════════
+st.markdown("---")
 n_paso = 4 if modo_avanzado else 3
 
 with st.spinner("Leyendo APUs de la entidad..."):
     bd_entidad, err_entidad = leer_apu_entidad(uploaded_entidad)
 
 if err_entidad:
-    st.error(f"❌ Error en APUs de la entidad: {err_entidad}")
+    st.error(f"❌ No se pudo leer el archivo de APUs de la entidad: {err_entidad}")
     st.stop()
 
-st.success(f"✅ APUs de la entidad: **{len(bd_entidad)}** ítems con componentes cargados.")
+# Mostrar info del AIU leído
+aiu_values = [v.get('aiu_factor', 1.0) for v in bd_entidad.values() if v.get('aiu_factor', 1.0) > 1.0]
+if aiu_values:
+    aiu_promedio = sum(aiu_values) / len(aiu_values)
+    aiu_unico    = len(set(round(x, 4) for x in aiu_values)) == 1
+    aiu_display  = f"{(aiu_promedio-1)*100:.2f}%" if aiu_unico else f"variable ({(min(aiu_values)-1)*100:.2f}% – {(max(aiu_values)-1)*100:.2f}%)"
+    st.success(
+        f"✅ APUs de la entidad: **{len(bd_entidad)}** ítems cargados  \n"
+        f"📊 Factor AIU detectado: **{aiu_display}** sobre el costo directo"
+    )
+else:
+    st.success(f"✅ APUs de la entidad: **{len(bd_entidad)}** ítems cargados (sin AIU — precio = costo directo)")
 
 with st.spinner("Leyendo propuesta económica..."):
     propuesta, err_prop = leer_propuesta_economica(uploaded_propuesta)
 
 if err_prop:
-    st.error(f"❌ Error en propuesta económica: {err_prop}")
+    st.error(f"❌ No se pudo leer la propuesta económica: {err_prop}")
     st.stop()
 
-st.success(f"✅ Propuesta económica: **{len(propuesta)}** ítems leídos.")
+st.success(f"✅ Propuesta económica: **{len(propuesta)}** ítems leídos")
 
-# ── Cruce y ajuste ────────────────────────────────────────────────────────────
 with st.spinner("Cruzando ítems y ajustando rendimientos de mano de obra..."):
     resultado = cruzar_y_ajustar(propuesta, bd_entidad)
 
@@ -132,94 +190,110 @@ sin_apu = resultado['items_sin_apu']
 n_total = resultado['total']
 cruces  = resultado['detalle_cruce']
 
-# ── Resumen del cruce ─────────────────────────────────────────────────────────
-st.subheader(f"{n_paso}. Resultado del cruce")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Resultado del cruce
+# ══════════════════════════════════════════════════════════════════════════════
+col_icon, col_title = st.columns([0.06, 0.94])
+col_icon.markdown(f"## {n_paso}️⃣")
+col_title.markdown("## Resultado del Cruce")
 n_paso += 1
 
 c1, c2, c3 = st.columns(3)
-c1.metric("Total ítems en propuesta",  n_total)
-c2.metric("✅ Con APU ajustado",        len(con_apu))
-c3.metric("🔴 Sin APU (marcar rojo)",  len(sin_apu))
+c1.metric("Total ítems en propuesta",    n_total)
+c2.metric("✅ APUs ajustados",           len(con_apu))
+c3.metric("🔴 Sin APU (completar)",     len(sin_apu))
 
 # Detalle ítems ajustados
 if con_apu:
-    with st.expander(f"✅ {len(con_apu)} ítems ajustados correctamente", expanded=False):
+    with st.expander(f"✅ Ver los {len(con_apu)} ítems ajustados correctamente", expanded=False):
         filas = []
         for item in con_apu:
+            aiu_f  = item.get('aiu_factor', 1.0)
+            cd     = item.get('cd_final', 0)
             precio = item['valor_ofrecido']
-            suma   = sum(
-                round(c['rend'] * c['unit_price'], 2)
-                for s in ('materiales', 'herramientas', 'transporte', 'mano_de_obra')
-                for c in item.get(s, [])
-            )
-            diff   = abs(precio - suma)
-            cierre = "✅" if diff < 0.02 else f"⚠️ dif=${diff:,.2f}"
-            metodo = cruces.get(item['code'], {}).get('metodo', '')
+            diff   = abs(precio - round(cd * aiu_f, 2))
+            cierre = "✅" if diff < 0.05 else f"⚠️ dif=${diff:,.2f}"
+            metodo = cruces.get(item['code'], {}).get('metodo_ajuste', '')
             filas.append({
-                'Ítem':        item['code'],
-                'Descripción': item['description'][:60],
-                'Unidad':      item['unit'],
-                'Precio ($)':  f"${precio:,.2f}",
-                'Cierre':      cierre,
-                'Cruce por':   metodo,
+                'Ítem':           item['code'],
+                'Descripción':    item['description'][:55],
+                'Unidad':         item['unit'],
+                'Precio ($)':     f"${precio:,.2f}",
+                'Costo Directo':  f"${cd:,.2f}",
+                'AIU':            f"{(aiu_f-1)*100:.2f}%" if aiu_f > 1 else '—',
+                'Cierre':         cierre,
+                'Ajuste vía':     metodo,
             })
         st.dataframe(pd.DataFrame(filas), use_container_width=True, hide_index=True)
 
 # Detalle ítems sin APU
 if sin_apu:
     with st.expander(
-        f"🔴 {len(sin_apu)} ítems SIN APU en la entidad — se marcarán en rojo",
+        f"🔴 {len(sin_apu)} ítems que quedarán en ROJO — necesitan completarse manualmente",
         expanded=True
     ):
         st.warning(
-            "Estos ítems no tienen APU correspondiente en el archivo de la entidad. "
-            "Se incluirán en el Excel con la hoja **vacía y en rojo** para que los complete manualmente."
+            "Estos ítems **no se encontraron** en el archivo de APUs de la entidad "
+            "(ni por código ni por descripción similar).  \n"
+            "Se incluirán en el Excel con la hoja **vacía y en rojo** para que usted "
+            "ingrese los componentes manualmente."
         )
         filas_r = []
         for item in sin_apu:
-            razon = cruces.get(item['code'], {}).get('razon', 'No encontrado en APUs de la entidad')
+            info   = cruces.get(item['code'], {})
+            motivo = info.get('razon', info.get('metodo', 'No encontrado'))
             filas_r.append({
                 'Ítem':        item['code'],
                 'Descripción': item['description'][:65],
                 'Precio ($)':  f"${item['valor_ofrecido']:,.2f}",
-                'Motivo':      razon,
+                'Motivo':      motivo,
             })
         st.dataframe(pd.DataFrame(filas_r), use_container_width=True, hide_index=True)
 
-# ── Generación del Excel ──────────────────────────────────────────────────────
-st.subheader(f"{n_paso}. Generar APUs en Excel")
 
-n_gen   = len(con_apu) + len(sin_apu)
-aiu_txt = f"con AIU ({aiu_pct*100:.1f}%)" if include_aiu else "sin AIU"
+# ══════════════════════════════════════════════════════════════════════════════
+# Generación del Excel
+# ══════════════════════════════════════════════════════════════════════════════
+st.markdown("---")
+col_icon, col_title = st.columns([0.06, 0.94])
+col_icon.markdown(f"## {n_paso}️⃣")
+col_title.markdown("## Generar y Descargar APUs en Excel")
+
+n_gen = len(con_apu) + len(sin_apu)
 
 if n_gen == 0:
-    st.warning("No hay ítems para generar.")
+    st.warning("No hay ítems para generar. Verifique los archivos cargados.")
 else:
+    st.markdown(f"""
+    El Excel resultante tendrá:
+    - **{len(con_apu)} hojas en verde** — APUs ajustados con rendimiento de MO calibrado al precio ofrecido
+    - **{len(sin_apu)} hojas en rojo** — ítems sin APU para completar manualmente
+    - **1 hoja RESUMEN** — tabla resumen de todos los ítems
+    """)
+
     if st.button(
-        f"🚀 Generar {n_gen} APU(s) — {aiu_txt}",
-        type="primary", use_container_width=True
+        f"🚀 Generar {n_gen} APU(s) en Excel",
+        type="primary",
+        use_container_width=True
     ):
-        with st.spinner(f"Generando {n_gen} APUs en Excel..."):
+        with st.spinner(f"Generando {n_gen} APUs..."):
             try:
                 excel_bytes = generate_apu_excel(
                     items_ajustados=con_apu,
                     items_sin_apu=sin_apu,
-                    include_aiu=include_aiu,
-                    aiu_pct=aiu_pct,
                     bd_externas=bds_externas if bds_externas else None,
                 )
                 st.session_state['excel_bytes']    = excel_bytes
                 st.session_state['nombre_archivo'] = (
                     uploaded_propuesta.name.replace('.xlsx','').replace('.xlsm','')
                 )
-                n_ok  = len(con_apu)
-                n_roj = len(sin_apu)
                 st.success(
-                    f"✅ **{n_ok} APUs ajustados** — precio unitario cierra exactamente con su oferta.  \n"
-                    f"🔴 **{n_roj} ítems en rojo** — sin componentes, para completar manualmente."
+                    f"✅ **{len(con_apu)} APUs generados** — precio unitario cierra exactamente con su oferta.  \n"
+                    f"🔴 **{len(sin_apu)} ítems en rojo** — sin componentes, para completar manualmente."
                 )
             except Exception as e:
-                st.error(f"❌ Error al generar: {e}")
+                st.error(f"❌ Error al generar el Excel: {e}")
                 raise e
 
     if 'excel_bytes' in st.session_state:
