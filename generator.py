@@ -66,10 +66,29 @@ def _rend_exacto(parcial_rd2, unit_price):
 
 
 def _es_transporte(tipo_str, desc_str):
-    """True si el componente debe ir a la sección TRANSPORTE."""
-    t = tipo_str.lower()
-    d = desc_str.lower()
-    return 'transporte' in t or 'transporte' in d or 'flete' in d
+    """
+    True si el componente debe ir a la sección TRANSPORTE.
+    
+    REGLA CORREGIDA: se basa principalmente en el TIPO del componente
+    (columna TIPO en el archivo APU), NO en la descripción.
+    La descripción puede decir 'SUMINISTRO, TRANSPORTE E INSTALACION' para
+    ítems de mobiliario/equipos — eso no los convierte en componentes de transporte.
+    
+    Solo se acepta 'transporte' por descripción si el TIPO es genérico (vacío, Insumos)
+    Y la descripción contiene palabras muy específicas como 'FLETE' o 'ACARREO'.
+    """
+    t = tipo_str.lower().strip()
+    d = desc_str.lower().strip()
+    
+    # El TIPO dice explícitamente transporte → sí
+    if 'transporte' in t:
+        return True
+    # La descripción tiene palabras de flete/acarreo (servicios de transporte reales)
+    # pero NO si el tipo es 'Insumos' o 'Actividad' (esos son materiales/ítems completos)
+    if any(x in d for x in ('flete', 'acarreo')):
+        if t not in ('insumos', 'actividad', 'analisis basico'):
+            return True
+    return False
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -338,9 +357,63 @@ def leer_apu_entidad(archivo):
 # LECTOR DE PROPUESTA ECONÓMICA
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _leer_resumen_propio(wb):
+    """
+    Detecta si el workbook es un output previo de esta app (tiene hoja RESUMEN
+    con encabezado 'PRECIO OFRECIDO' en col D) y lee los ítems desde allí.
+    Retorna list[dict] o [] si no aplica.
+    """
+    # Buscar hoja llamada RESUMEN o RESUMEN DE APUs
+    ws_res = None
+    for nombre in wb.sheetnames:
+        if nombre.strip().upper() == 'RESUMEN':
+            ws_res = wb[nombre]; break
+    if ws_res is None:
+        return []
+
+    # Verificar que la fila 2 tiene encabezados de la app
+    fila2 = [str(v).upper().strip() if v else '' for v in
+             next(ws_res.iter_rows(min_row=2, max_row=2, values_only=True))]
+    # Esperar: ÍTEM, DESCRIPCIÓN, UND., PRECIO OFRECIDO ...
+    tiene_encabezado = any('PRECIO' in c and 'OFRECIDO' in c for c in fila2)
+    if not tiene_encabezado:
+        return []
+
+    # Columnas: A=código, B=desc, C=unidad, D=PRECIO OFRECIDO
+    items  = []
+    vistos = set()
+    for row in ws_res.iter_rows(min_row=3, values_only=True):
+        code = str(row[0]).strip() if row[0] else ''
+        if not code or code in vistos:
+            continue
+        # Ignorar fila de totales (código muy largo o empieza con TOTAL)
+        if 'TOTAL' in code.upper() or len(code) > 20:
+            continue
+        desc  = str(row[1]).strip() if row[1] else code
+        und   = str(row[2]).strip() if row[2] else ''
+        precio_raw = row[3]
+        try:
+            precio = float(precio_raw)
+        except Exception:
+            continue
+        if precio <= 0:
+            continue
+        items.append({'code': code, 'description': desc, 'unit': und,
+                      'valor_ofrecido': precio})
+        vistos.add(code)
+    return items
+
+
 def leer_propuesta_economica(archivo):
     """
     Lee la propuesta económica del proponente (precios ofrecidos).
+
+    Soporta dos formatos:
+      A) Archivo con hoja RESUMEN generada por esta app (output previo).
+         Columnas: ÍTEM | DESCRIPCIÓN | UND. | PRECIO OFRECIDO
+      B) Cualquier Excel con columna de VALOR UNITARIO / PRECIO UNITARIO
+         (formato PRESUPUESTO, FORMULARIO, etc.)
+
     Retorna: (list[dict], error_str | None)
     """
     try:
@@ -349,6 +422,12 @@ def leer_propuesta_economica(archivo):
     except Exception as e:
         return [], f"No se pudo abrir la propuesta económica: {e}"
 
+    # ── Método A: hoja RESUMEN propia de la app ───────────────────────────────
+    items_resumen = _leer_resumen_propio(wb)
+    if items_resumen:
+        return items_resumen, None
+
+    # ── Método B: hoja estándar de presupuesto ────────────────────────────────
     ws       = _encontrar_hoja_presupuesto(wb)
     fila_enc, mapa = _detectar_columnas(ws)
 
@@ -363,8 +442,10 @@ def leer_propuesta_economica(archivo):
 
     if fila_enc is None or 'col_valor' not in mapa:
         return [], (
-            f"No se encontró columna de valor unitario en '{ws.title}'. "
-            f"Hojas disponibles: {', '.join(wb.sheetnames)}"
+            f"No se encontró columna de valor unitario en el archivo de propuesta.  \n"
+            f"Hojas disponibles: {', '.join(wb.sheetnames[:10])}...  \n"
+            "Verifique que el archivo tenga una hoja con columnas de PRESUPUESTO "
+            "o que sea un output previo de esta aplicación."
         )
 
     col_valor = mapa['col_valor']
@@ -387,12 +468,13 @@ def leer_propuesta_economica(archivo):
             continue
         if valor <= 0:
             continue
-        items.append({'code': codigo, 'description': desc, 'unit': und, 'valor_ofrecido': valor})
+        items.append({'code': codigo, 'description': desc, 'unit': und,
+                      'valor_ofrecido': valor})
         vistos.add(codigo)
 
     if not items:
         return [], (
-            f"No se encontraron ítems con valor unitario en '{ws.title}'. "
+            f"No se encontraron ítems con valor unitario en '{ws.title}'.  \n"
             "Verifique el formato del archivo."
         )
     return items, None
