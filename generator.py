@@ -1,6 +1,6 @@
 """
 Generador de APUs — Gerencia Legal Integral Colombia S.A.S.
-v12: Correcciones de forma y motor de ajuste completo.
+v13: Soporte de APUs en PDF (Gobernación/entidades sin Excel).
 
 CAMBIOS v12:
   - Columnas más anchas (descripción visible completa)
@@ -15,7 +15,7 @@ CAMBIOS v12:
 """
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-import io, re, unicodedata, copy
+import io, re, unicodedata, copy, subprocess, tempfile, os
 
 from numero_letras import numero_a_letras
 from detector import (
@@ -325,6 +325,253 @@ def _leer_apu_presupuesto_directo(ws):
     return apus
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# LECTOR DE APUs DESDE PDF (Gobernación, entidades sin Excel)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _tiene_pdftotext():
+    """Verifica si pdftotext (poppler-utils) está disponible en el sistema."""
+    try:
+        r = subprocess.run(["pdftotext", "-v"], capture_output=True, timeout=5)
+        return True
+    except (FileNotFoundError, OSError, Exception):
+        return False
+
+
+def _extraer_texto_pagina_pdf(ruta_pdf, numero_pagina):
+    """
+    Extrae el texto de UNA página del PDF preservando el layout espacial.
+    Usa pdftotext -layout (poppler) si está disponible; si no, pdfplumber.
+    """
+    if _tiene_pdftotext():
+        r = subprocess.run(
+            ["pdftotext", "-layout",
+             "-f", str(numero_pagina), "-l", str(numero_pagina),
+             ruta_pdf, "-"],
+            capture_output=True, text=True, timeout=30
+        )
+        return r.stdout
+    else:
+        try:
+            import pdfplumber
+            with pdfplumber.open(ruta_pdf) as pdf:
+                if numero_pagina - 1 < len(pdf.pages):
+                    return pdf.pages[numero_pagina - 1].extract_text(layout=True) or ""
+        except Exception:
+            pass
+        return ""
+
+
+def _contar_paginas_pdf(ruta_pdf):
+    """Cuenta las páginas de un PDF."""
+    try:
+        r = subprocess.run(["pdfinfo", ruta_pdf], capture_output=True, text=True, timeout=15)
+        for linea in r.stdout.split("\n"):
+            if linea.startswith("Pages:"):
+                return int(linea.split(":")[1].strip())
+    except Exception:
+        pass
+    try:
+        import pdfplumber
+        with pdfplumber.open(ruta_pdf) as pdf:
+            return len(pdf.pages)
+    except Exception:
+        return 0
+
+
+def _num_pdf(txt):
+    """Convierte texto con formato numérico colombiano a float."""
+    s = str(txt).replace("$", "").replace(",", "").strip()
+    try:
+        return float(s)
+    except (ValueError, TypeError):
+        return None
+
+
+def _parsear_pagina_apu_pdf(texto):
+    """
+    Parsea el texto de UNA página de APU (formato pdftotext -layout).
+    Detecta: código, descripción, unidad, costo directo y componentes
+    de las 4 secciones estándar colombianas:
+      I.   EQUIPO           → herramientas
+      II.  MATERIALES       → materiales
+      III. TRANSPORTES      → transporte
+      IV.  MANO DE OBRA     → mano_de_obra
+
+    El dict generado es 100% compatible con el resto del flujo (cruce y ajuste).
+    """
+    PAT_ITEM  = re.compile(r"ITEM:\s*(\d+(?:\.\d+)+)\.?\s*(.*)", re.IGNORECASE)
+    PAT_UNIT  = re.compile(r"UNIDAD:\s*(\S+)",                        re.IGNORECASE)
+    PAT_TOTAL = re.compile(r"Total\s+Costo\s+Directo\s+\$\s*([\d,. ]+)", re.IGNORECASE)
+    UNIDADES  = {
+        "M3", "M2", "ML", "GL", "UND", "UN", "KG", "LB", "D", "TON",
+        "HR", "JN", "MES", "HA", "KM", "M3-KM", "%", "H", "GBL", "VJE",
+        "DIA", "VIAJE", "BULTO", "PAR", "JGO", "SET", "M", "CM", "MM",
+    }
+
+    apu = {
+        "code": None, "description": "", "unit": "",
+        "total_referencia": 0.0, "aiu_factor": 1.0,
+        "materiales": [], "herramientas": [], "transporte": [], "mano_de_obra": [],
+    }
+    seccion    = None
+    desc_lines = []
+
+    for linea in texto.split("\n"):
+        l = linea.strip()
+
+        # Inicio de ítem
+        m = PAT_ITEM.search(linea)
+        if m:
+            apu["code"] = m.group(1).rstrip(".")
+            resto = m.group(2).strip()
+            desc_lines = [resto] if resto else []
+            seccion    = None
+            continue
+
+        if apu["code"] is None:
+            continue
+
+        # Continuación de descripción
+        if not apu["description"] and not seccion and l:
+            if (not l.startswith("PROVINCIA") and not l.startswith("MUNICIPIO")
+                    and not re.match(r"^[IVX]+\.", l)
+                    and not l.startswith("ESPECIF") and not l.startswith("UNIDAD")):
+                if re.search(r"[A-ZÁÉÍÓÚÑ]{3,}", l) and not re.search(r"\d{3,}", l):
+                    desc_lines.append(l)
+
+        # Unidad del ítem
+        m_u = PAT_UNIT.search(linea)
+        if m_u:
+            apu["unit"] = m_u.group(1).strip()
+            if desc_lines and not apu["description"]:
+                apu["description"] = " ".join(desc_lines).strip()
+            continue
+
+        # Secciones
+        if re.match(r"\s*I\.\s+EQUIPO",              linea, re.I): seccion = "herramientas"; continue
+        if re.match(r"\s*II\.\s+MATERIALES",          linea, re.I): seccion = "materiales";   continue
+        if re.match(r"\s*III\.\s+TRANSPORTE",         linea, re.I): seccion = "transporte";   continue
+        if re.match(r"\s*IV\.\s+MANO\s+DE\s+OBRA", linea, re.I): seccion = "mano_de_obra"; continue
+
+        # Ignorar encabezados y subtotales
+        if re.search(r"Descripci[oó]n|Trabajador|Material\s+Vol|Sub-Total", linea, re.I):
+            continue
+
+        # Total Costo Directo
+        m_t = PAT_TOTAL.search(linea)
+        if m_t:
+            val = _num_pdf(m_t.group(1).replace(" ", ""))
+            if val:
+                apu["total_referencia"] = val
+            continue
+
+        if seccion is None:
+            continue
+
+        # Parsear línea de componente
+        tokens = linea.split()
+        if len(tokens) < 3:
+            continue
+
+        nums     = []
+        desc_tok = []
+        for tok in tokens:
+            n = _num_pdf(tok)
+            if n is not None and n > 0:
+                nums.append(n)
+            else:
+                desc_tok.append(tok)
+
+        if len(nums) < 2:
+            continue
+
+        valor_unit = nums[-1]
+        desc_parte = " ".join(desc_tok).strip()
+        unit_comp  = ""
+
+        m_uc = re.match(
+            r"^(.*?)\s+(" + "|".join(re.escape(u) for u in UNIDADES) + r")\s*$",
+            desc_parte, re.IGNORECASE
+        )
+        if m_uc:
+            desc_final = m_uc.group(1).strip()
+            unit_comp  = m_uc.group(2).upper()
+        else:
+            desc_final = desc_parte
+
+        if not desc_final or len(desc_final) < 2:
+            continue
+
+        if seccion in ("herramientas", "mano_de_obra"):
+            rendimiento = nums[-2] if len(nums) >= 2 else 1.0
+            precio_base = round(valor_unit * rendimiento, 4) if rendimiento > 0 else valor_unit
+            rend_real   = round(1.0 / rendimiento, 6)        if rendimiento > 0 else 0
+            apu[seccion].append({
+                "description": desc_final, "unit": unit_comp,
+                "rend": rend_real, "unit_price": round(precio_base, 2),
+            })
+        else:
+            cantidad = nums[-2] if len(nums) >= 2 else 1.0
+            precio_u = nums[-3] if len(nums) >= 3 else valor_unit
+            apu[seccion].append({
+                "description": desc_final, "unit": unit_comp,
+                "rend": round(float(cantidad), 6),
+                "unit_price": round(float(precio_u), 2),
+            })
+
+    return apu if apu["code"] else None
+
+
+def leer_apu_entidad_pdf(archivo_pdf):
+    """
+    Lee APUs desde un archivo PDF (Gobernación, entidades sin Excel).
+    Procesa página por página — una página = un APU.
+    Si el mismo código aparece en múltiples municipios, conserva el último.
+
+    Retorna: (dict{codigo → apu_dict}, error_str | None)
+    100% compatible con cruzar_y_ajustar() y generate_apu_excel().
+    """
+    ruta_temporal = None
+    try:
+        if hasattr(archivo_pdf, "read"):
+            data = archivo_pdf.read()
+            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                tmp.write(data)
+                ruta_temporal = tmp.name
+        else:
+            ruta_temporal = str(archivo_pdf)
+
+        n_pages = _contar_paginas_pdf(ruta_temporal)
+        if n_pages == 0:
+            return {}, "No se pudo determinar el número de páginas del PDF."
+
+        bd = {}
+        for pag in range(1, n_pages + 1):
+            texto = _extraer_texto_pagina_pdf(ruta_temporal, pag)
+            apu   = _parsear_pagina_apu_pdf(texto)
+            if apu and apu["code"]:
+                bd[apu["code"]] = apu
+
+        if not bd:
+            return {}, (
+                "No se encontraron APUs en el PDF.\n"
+                "Verifique que tenga el formato estándar colombiano:\n"
+                "  ITEM: X.XX → I. EQUIPO → II. MATERIALES → IV. MANO DE OBRA\n"
+                "  Total Costo Directo: $..."
+            )
+        return bd, None
+
+    except Exception as e:
+        return {}, f"Error al procesar el PDF: {e}"
+    finally:
+        if ruta_temporal and hasattr(archivo_pdf, "read"):
+            try:
+                os.unlink(ruta_temporal)
+            except Exception:
+                pass
+
+
 def _leer_aiu_global(wb):
     """
     Intenta extraer un factor AIU global del workbook buscando:
@@ -345,19 +592,35 @@ def _leer_aiu_global(wb):
 
 def leer_apu_entidad(archivo):
     """
-    Lee el archivo Excel de APUs de la entidad.
-    Intenta todos los formatos conocidos en orden de prioridad:
+    Lee el archivo de APUs de la entidad.
+    Acepta XLSX/XLSM (Excel) y PDF.
+
+    Para Excel, intenta todos los formatos en orden de prioridad:
       1. Hojas individuales 'APU X.XX' (formato SENA/Gobernación)
       2. Hoja columnar 'APU' con CODINS='-' (formato CIMM/COMM) — lee AIU por ítem
       3. APUs embebidos con señal textual 'ANALISIS DE PRECIOS UNITARIOS - APU'
-      4. Hoja RESUMEN del output propio de la app (para re-procesar)
     Para formatos 1 y 3, intenta leer el AIU global desde hoja AU/AIU si existe.
+
+    Para PDF: parsea página por página con _parsear_pagina_apu_pdf().
+    El dict resultante es idéntico al de Excel — compatible con todo el flujo.
+
     Retorna: (dict{codigo → apu_dict}, error_str | None)
     """
+    # ── Detectar si es PDF ────────────────────────────────────────────────────
+    nombre = getattr(archivo, "name", "") or ""
+    if nombre.lower().endswith(".pdf"):
+        return leer_apu_entidad_pdf(archivo)
+
+    # Si es BytesIO o archivo ya leído, verificar los primeros bytes (magic number PDF)
+    if hasattr(archivo, "read"):
+        data = archivo.read()
+        if data[:4] == b"%PDF":
+            import io as _io2
+            return leer_apu_entidad_pdf(_io2.BytesIO(data))
+        archivo = io.BytesIO(data)
+
+    # ── Procesar Excel ────────────────────────────────────────────────────────
     try:
-        if hasattr(archivo, 'read'):
-            data = archivo.read()
-            archivo = io.BytesIO(data)
         wb = load_workbook(archivo, data_only=True)
     except Exception as e:
         return {}, f"No se pudo abrir el archivo de APUs de la entidad: {e}"

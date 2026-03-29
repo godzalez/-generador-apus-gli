@@ -50,7 +50,7 @@ with st.sidebar:
         )
     st.divider()
     st.markdown("⚠️ Use descripciones **genéricas** (sin marcas comerciales).")
-    st.caption("v11.0 · GLI Colombia · 2026")
+    st.caption("v13.0 · GLI Colombia · 2026")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -63,16 +63,17 @@ col_title.markdown("## APUs de la Entidad")
 
 st.markdown("""
 > **¿Qué archivo cargar aquí?**  
-> El archivo Excel que **la entidad contratante le entregó** con los análisis de precios unitarios del proceso.
-> Este archivo contiene los componentes de cada ítem: materiales, equipos, mano de obra y transporte.
+> El archivo que **la entidad contratante le entregó** con los análisis de precios unitarios del proceso.  
+> Puede ser **Excel (.xlsx)** o **PDF** — la aplicación detecta el formato automáticamente.  
+> Debe contener los componentes de cada ítem: materiales, equipos, mano de obra y transporte.  
 > La aplicación tomará estos componentes como base y **solo ajustará el rendimiento de la mano de obra**.
 """)
 
 uploaded_entidad = st.file_uploader(
     "📂 Seleccione el archivo de APUs de la Entidad",
-    type=["xlsx", "xlsm"],
+    type=["xlsx", "xlsm", "pdf"],
     key="entidad",
-    help="Archivo Excel entregado por la entidad con la hoja APU y sus componentes."
+    help="Excel (.xlsx) o PDF con los APUs de la entidad. El sistema detecta el formato automáticamente."
 )
 if uploaded_entidad:
     st.success(f"✅ Archivo cargado: **{uploaded_entidad.name}**")
