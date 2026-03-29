@@ -1,21 +1,17 @@
 """
 Generador de APUs — Gerencia Legal Integral Colombia S.A.S.
-v11: Corrección AIU por ítem + precios unitarios siempre intactos.
+v12: Correcciones de forma y motor de ajuste completo.
 
-FLUJO:
-  1. leer_apu_entidad()         → lee APUs del archivo de la entidad
-                                   (componentes + factor AIU por ítem desde col J)
-  2. leer_propuesta_economica() → lee precios ofrecidos por el proponente
-  3. cruzar_y_ajustar()         → cruza por código (luego descripción)
-                                   CD_objetivo = precio_ofrecido ÷ aiu_factor
-                                   Ajusta SOLO el rendimiento de MO
-  4. generate_apu_excel()        → Excel: hojas APU + RESUMEN
-
-REGLAS DE AJUSTE (Reglas Generales):
-  - Materiales, herramientas, transporte → precios unitarios INTACTOS, sin cambios.
-  - Único ajuste: rendimiento de mano de obra.
-  - Último recurso si MO genera negativos: rendimiento de equipos/herramientas.
-  - Cierre exacto a 2 decimales, sin valores negativos.
+CAMBIOS v12:
+  - Columnas más anchas (descripción visible completa)
+  - Bordes en todas las celdas (todos los lados)
+  - TRANSPORTE detectado por descripción además de tipo
+  - PRECIO UNITARIO con fórmula (no hardcodeado)
+  - Motor de ajuste de 3 niveles:
+      1. Rendimiento Mano de Obra
+      2. Rendimiento Herramientas/Equipos
+      3. Valor unitario de Materiales (último recurso)
+  - Ítems sin MO: ajusta materiales directamente
 """
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -58,10 +54,7 @@ def _safe_name(code):
 
 
 def _rend_exacto(parcial_rd2, unit_price):
-    """
-    Devuelve rendimiento (10 dec) tal que ROUND(rend × unit_price, 2) == parcial_rd2.
-    Garantiza que la fórmula Excel =ROUND(F*G,2) cierre exactamente.
-    """
+    """Rendimiento (10 dec) tal que ROUND(rend × unit_price, 2) == parcial_rd2."""
     if unit_price <= 0:
         return 0.0
     base = parcial_rd2 / unit_price
@@ -72,12 +65,19 @@ def _rend_exacto(parcial_rd2, unit_price):
     return round(base, 10)
 
 
+def _es_transporte(tipo_str, desc_str):
+    """True si el componente debe ir a la sección TRANSPORTE."""
+    t = tipo_str.lower()
+    d = desc_str.lower()
+    return 'transporte' in t or 'transporte' in d or 'flete' in d
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # LECTORES DE APUs DE LA ENTIDAD
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _leer_apu_hoja_individual(ws):
-    """Lee APU desde hoja individual tipo SENA/Gobernación. AIU factor = 1.0."""
+    """Lee APU desde hoja individual tipo SENA/Gobernación."""
     apu = {
         'description': '', 'unit': '', 'total_referencia': 0,
         'aiu_factor': 1.0,
@@ -94,7 +94,10 @@ def _leer_apu_hoja_individual(ws):
 
         if any(x in primera for x in ('INSUMO', 'MATERIAL')):
             seccion = 'materiales'; COL_DESC = COL_VUNIT = COL_CANT = None; continue
-        if any(x in primera for x in ('EQUIPO', 'HERRAMIENTA', 'TRANSPORTE')):
+        # Detectar TRANSPORTE antes de EQUIPO para no confundir
+        if 'TRANSPORTE' in primera:
+            seccion = 'transporte'; COL_DESC = COL_VUNIT = COL_CANT = None; continue
+        if any(x in primera for x in ('EQUIPO', 'HERRAMIENTA')):
             seccion = 'herramientas'; COL_DESC = COL_VUNIT = COL_CANT = None; continue
         if any(x in primera for x in ('MANO DE OB', 'MANO OB')):
             seccion = 'mano_de_obra'; COL_DESC = COL_VUNIT = COL_CANT = None; continue
@@ -130,13 +133,15 @@ def _leer_apu_hoja_individual(ws):
                     und = str(row_list[j]).strip(); break
         if not desc:
             continue
-        apu[seccion].append({'description': desc, 'unit': und,
-                              'rend': float(cant_v), 'unit_price': float(vunit_v)})
+
+        # Reclasificar a TRANSPORTE si la descripción lo indica
+        sec_real = 'transporte' if _es_transporte('', desc) else seccion
+        apu[sec_real].append({'description': desc, 'unit': und,
+                               'rend': float(cant_v), 'unit_price': float(vunit_v)})
     return apu
 
 
 def _leer_hojas_apu_individuales(wb):
-    """Lee todas las hojas 'APU X.XX' del workbook."""
     bd = {}
     for nombre in wb.sheetnames:
         n = nombre.strip()
@@ -168,10 +173,9 @@ def _leer_hojas_apu_individuales(wb):
 
 def _leer_apu_columnar(ws_apu):
     """
-    Lee hoja APU columnar estándar (CODINS='-').
-    LEE el factor AIU desde columna J (índice 9) — formato COMM/CIMM/entidades.
-    Si el valor de col J > 1, se interpreta como factor multiplicador del costo directo.
-    Ejemplo: 1.3502 → el precio = costo_directo × 1.3502 → AIU = 35.02 %.
+    Lee hoja APU columnar (CODINS='-').
+    Clasifica TRANSPORTE por tipo O por descripción del insumo.
+    Lee factor AIU desde columna J (índice 9).
     """
     bd = {}
     current = None
@@ -190,7 +194,6 @@ def _leer_apu_columnar(ws_apu):
         uprice = row[6]
         total  = row[8]
 
-        # Factor AIU en columna J (índice 9)
         aiu_raw = row[9] if len(row) > 9 else None
         try:
             aiu_factor = float(aiu_raw) if (aiu_raw is not None and
@@ -217,14 +220,15 @@ def _leer_apu_columnar(ws_apu):
             except Exception:
                 continue
             t = tipo.lower()
-            if any(x in t for x in ('insumo','analisis','actividad','ensayo')):
-                bd[current]['materiales'].append(comp)
+            # TRANSPORTE: chequeado primero por tipo Y por descripción
+            if _es_transporte(tipo, insumo):
+                bd[current]['transporte'].append(comp)
             elif any(x in t for x in ('herramienta','equipo')):
                 bd[current]['herramientas'].append(comp)
             elif any(x in t for x in ('cuadrilla','personal','mano')):
                 bd[current]['mano_de_obra'].append(comp)
-            elif 'transporte' in t:
-                bd[current]['transporte'].append(comp)
+            elif any(x in t for x in ('insumo','analisis','actividad','ensayo')):
+                bd[current]['materiales'].append(comp)
             else:
                 bd[current]['materiales'].append(comp)
     return bd
@@ -233,7 +237,6 @@ def _leer_apu_columnar(ws_apu):
 def _leer_apu_presupuesto_directo(ws):
     """
     Lee APUs embebidos en hoja de presupuesto (señal 'ANALISIS DE PRECIOS UNITARIOS - APU').
-    AIU factor = 1.0 por defecto (este formato no lo incluye).
     """
     SECCIONES = {
         10000: 'materiales', 20000: 'mano_de_obra',
@@ -282,9 +285,12 @@ def _leer_apu_presupuesto_directo(ws):
                 c6 is not None and isinstance(c6, (int, float)) and c6 > 0):
             vr_unit = float(c5)
             rend    = float(c6) / vr_unit if vr_unit > 0 else 0
+            desc    = str(c1).strip()
             if rend > 0:
-                current[seccion].append({
-                    'description': str(c1).strip(),
+                # Reclasificar a transporte si descripción lo indica
+                sec_real = 'transporte' if _es_transporte('', desc) else seccion
+                current[sec_real].append({
+                    'description': desc,
                     'unit':        str(c2).strip() if c2 else '',
                     'rend':        round(rend, 6),
                     'unit_price':  vr_unit,
@@ -295,7 +301,7 @@ def _leer_apu_presupuesto_directo(ws):
 def leer_apu_entidad(archivo):
     """
     Lee el archivo Excel de APUs de la entidad.
-    Combina todos los métodos de lectura disponibles.
+    Combina todos los métodos de lectura.
     Retorna: (dict{codigo → apu_dict}, error_str | None)
     """
     try:
@@ -334,7 +340,7 @@ def leer_apu_entidad(archivo):
 
 def leer_propuesta_economica(archivo):
     """
-    Lee la propuesta económica del proponente.
+    Lee la propuesta económica del proponente (precios ofrecidos).
     Retorna: (list[dict], error_str | None)
     """
     try:
@@ -393,95 +399,133 @@ def leer_propuesta_economica(archivo):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MOTOR DE AJUSTE
+# MOTOR DE AJUSTE — 3 NIVELES + caso sin MO
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _ajustar_rendimiento_mo(item, cd_objetivo):
     """
-    Ajusta SOLO el rendimiento de MO (o herramientas como último recurso)
-    para que Σ(componentes) = cd_objetivo (costo directo = precio ÷ AIU_factor).
+    Ajusta componentes para que Σ = cd_objetivo.
 
-    Los precios unitarios de todos los insumos permanecen INTACTOS.
+    Orden de prioridad (Reglas Generales):
+      1. Rendimiento Mano de Obra (cuadrilla)
+      2. Rendimiento Herramientas/Equipos
+      3. Valor unitario de Materiales (proporcional, último recurso)
+      Sin MO: ajusta materiales directamente.
     """
     def subtotal(comps):
         return sum(round(c['rend'] * c['unit_price'], 10) for c in comps)
 
-    suma_fija = subtotal(item['materiales']) + subtotal(item['transporte'])
-    suma_her  = subtotal(item['herramientas'])
-    suma_mo   = subtotal(item['mano_de_obra'])
-
-    necesario_mo = round(cd_objetivo - suma_fija - suma_her, 10)
-
-    # ── Prioridad 1: ajustar Mano de Obra ────────────────────────────────────
-    if item['mano_de_obra'] and necesario_mo >= 0:
-        mo_original  = suma_mo if suma_mo > 0 else 1.0
-        componentes  = copy.deepcopy(item['mano_de_obra'])
+    def _ajustar_rendimientos(componentes, necesario, original_sum):
+        """Ajusta los rendimientos de una lista de componentes para sumar 'necesario'."""
+        if not componentes or necesario < 0:
+            return None
+        orig = original_sum if original_sum > 0 else 1.0
+        ajustados    = []
         acumulado_rd = 0.0
-        mo_ajustada  = []
-
-        for i, comp in enumerate(componentes):
+        for i, comp in enumerate(copy.deepcopy(componentes)):
             up = comp['unit_price']
             if i == len(componentes) - 1:
-                residuo_rd2  = round(necesario_mo - acumulado_rd, 2)
-                comp['rend'] = _rend_exacto(residuo_rd2, up)
+                residuo      = round(necesario - acumulado_rd, 2)
+                comp['rend'] = _rend_exacto(residuo, up)
             else:
-                peso       = (comp['rend'] * up) / mo_original if mo_original > 0 else 0
-                parcial_rd = round(necesario_mo * peso, 2)
-                comp['rend'] = _rend_exacto(parcial_rd, up)
+                peso         = (comp['rend'] * up) / orig
+                parcial      = round(necesario * peso, 2)
+                comp['rend'] = _rend_exacto(parcial, up)
                 acumulado_rd += round(comp['rend'] * up, 2)
             comp['rend'] = max(comp['rend'], 0)
-            mo_ajustada.append(comp)
+            ajustados.append(comp)
+        return ajustados
 
-        item['mano_de_obra'] = mo_ajustada
-        total_real = round(suma_fija + suma_her +
-                           sum(round(c['rend'] * c['unit_price'], 2) for c in mo_ajustada), 2)
-        return {'ok': True, 'metodo_ajuste': 'Mano de obra', 'total_final': total_real}
-
-    # ── Prioridad 2 (último recurso): ajustar Herramientas/Equipos ───────────
-    necesario_her = round(cd_objetivo - suma_fija - suma_mo, 10)
-    if item['herramientas'] and necesario_her >= 0:
-        her_original = suma_her if suma_her > 0 else 1.0
-        componentes  = copy.deepcopy(item['herramientas'])
-        acumulado_rd = 0.0
-        her_ajustada = []
-
-        for i, comp in enumerate(componentes):
-            up = comp['unit_price']
+    def _ajustar_precio_materiales(componentes, necesario):
+        """
+        Ajusta el precio unitario de los materiales proporcional al peso original.
+        Solo se llama como último recurso.
+        """
+        if not componentes or necesario < 0:
+            return None
+        total_orig = subtotal(componentes)
+        if total_orig <= 0:
+            return None
+        ajustados = []
+        acumulado  = 0.0
+        for i, comp in enumerate(copy.deepcopy(componentes)):
             if i == len(componentes) - 1:
-                residuo_rd2  = round(necesario_her - acumulado_rd, 2)
-                comp['rend'] = _rend_exacto(residuo_rd2, up)
+                parcial_restante = round(necesario - acumulado, 2)
+                comp['unit_price'] = round(parcial_restante / comp['rend'], 2) if comp['rend'] > 0 else comp['unit_price']
             else:
-                peso       = (comp['rend'] * up) / her_original if her_original > 0 else 0
-                parcial_rd = round(necesario_her * peso, 2)
-                comp['rend'] = _rend_exacto(parcial_rd, up)
-                acumulado_rd += round(comp['rend'] * up, 2)
-            comp['rend'] = max(comp['rend'], 0)
-            her_ajustada.append(comp)
+                peso               = (comp['rend'] * comp['unit_price']) / total_orig
+                parcial            = round(necesario * peso, 2)
+                comp['unit_price'] = round(parcial / comp['rend'], 2) if comp['rend'] > 0 else comp['unit_price']
+                acumulado         += round(comp['rend'] * comp['unit_price'], 2)
+            comp['unit_price'] = max(comp['unit_price'], 0)
+            ajustados.append(comp)
+        return ajustados
 
-        item['herramientas'] = her_ajustada
-        total_real = round(suma_fija +
-                           sum(round(c['rend'] * c['unit_price'], 2) for c in her_ajustada) +
-                           suma_mo, 2)
-        return {'ok': True, 'metodo_ajuste': 'Herramientas/Equipos (último recurso)', 'total_final': total_real}
+    suma_mat = subtotal(item['materiales'])
+    suma_her = subtotal(item['herramientas'])
+    suma_tra = subtotal(item['transporte'])
+    suma_mo  = subtotal(item['mano_de_obra'])
+    tiene_mo = bool(item['mano_de_obra'])
+
+    # ── CASO: Ítem SIN mano de obra → ajustar materiales directamente ─────────
+    if not tiene_mo:
+        necesario_mat = round(cd_objetivo - suma_her - suma_tra, 10)
+        if necesario_mat >= 0 and item['materiales']:
+            ajustados = _ajustar_precio_materiales(item['materiales'], necesario_mat)
+            if ajustados:
+                item['materiales'] = ajustados
+                total_real = round(subtotal(ajustados) + suma_her + suma_tra, 2)
+                return {'ok': True, 'metodo_ajuste': 'Precio materiales (sin MO)', 'total_final': total_real}
+        return {
+            'ok': False, 'metodo_ajuste': 'ninguno',
+            'total_final': round(suma_mat + suma_her + suma_tra, 2),
+            'razon': f"Sin MO y no es posible ajustar materiales (CD objetivo={cd_objetivo:,.2f})",
+        }
+
+    # ── NIVEL 1: Rendimiento Mano de Obra ─────────────────────────────────────
+    necesario_mo = round(cd_objetivo - suma_mat - suma_her - suma_tra, 10)
+    if necesario_mo >= 0:
+        ajustados = _ajustar_rendimientos(item['mano_de_obra'], necesario_mo, suma_mo)
+        if ajustados:
+            item['mano_de_obra'] = ajustados
+            total_real = round(suma_mat + suma_her + suma_tra +
+                               sum(round(c['rend']*c['unit_price'],2) for c in ajustados), 2)
+            return {'ok': True, 'metodo_ajuste': 'Rendimiento mano de obra', 'total_final': total_real}
+
+    # ── NIVEL 2: Rendimiento Herramientas/Equipos ─────────────────────────────
+    necesario_her = round(cd_objetivo - suma_mat - suma_mo - suma_tra, 10)
+    if necesario_her >= 0 and item['herramientas']:
+        ajustados = _ajustar_rendimientos(item['herramientas'], necesario_her, suma_her)
+        if ajustados:
+            item['herramientas'] = ajustados
+            total_real = round(suma_mat + sum(round(c['rend']*c['unit_price'],2) for c in ajustados) +
+                               suma_tra + suma_mo, 2)
+            return {'ok': True, 'metodo_ajuste': 'Rendimiento herramientas (nivel 2)', 'total_final': total_real}
+
+    # ── NIVEL 3: Precio unitario de Materiales (último recurso) ───────────────
+    necesario_mat = round(cd_objetivo - suma_her - suma_mo - suma_tra, 10)
+    if necesario_mat >= 0 and item['materiales']:
+        ajustados = _ajustar_precio_materiales(item['materiales'], necesario_mat)
+        if ajustados:
+            item['materiales'] = ajustados
+            total_real = round(sum(round(c['rend']*c['unit_price'],2) for c in ajustados) +
+                               suma_her + suma_tra + suma_mo, 2)
+            return {'ok': True, 'metodo_ajuste': 'Precio materiales (último recurso)', 'total_final': total_real}
 
     return {
-        'ok': False,
-        'metodo_ajuste': 'ninguno',
-        'total_final': round(suma_fija + suma_her + suma_mo, 2),
+        'ok': False, 'metodo_ajuste': 'ninguno',
+        'total_final': round(suma_mat + suma_her + suma_tra + suma_mo, 2),
         'razon': (
-            f"El precio ofrecido (CD objetivo={cd_objetivo:,.2f}) es menor que el "
-            f"costo fijo de materiales+transporte ({suma_fija:,.2f}). "
-            "No es posible ajustar sin generar valores negativos."
+            f"No fue posible ajustar ningún componente para alcanzar "
+            f"CD={cd_objetivo:,.2f} sin generar valores negativos."
         ),
     }
 
 
 def cruzar_y_ajustar(propuesta, bd_entidad):
     """
-    Cruza ítem por ítem la propuesta económica con los APUs de la entidad.
-
-    Cruce: 1) código exacto → 2) similitud de descripción (umbral 60%).
-    Ajuste: CD_objetivo = precio_ofrecido ÷ aiu_factor (leído del archivo entidad).
+    Cruza ítem por ítem la propuesta con los APUs de la entidad y ajusta.
+    Cruce: 1) código exacto → 2) similitud descripción ≥ 60%.
     """
     indice_desc = {
         _normalizar(apu.get('description', '')) or _normalizar(code): (code, apu)
@@ -496,11 +540,9 @@ def cruzar_y_ajustar(propuesta, bd_entidad):
         code   = item_prop['code']
         precio = round(item_prop['valor_ofrecido'], 2)
 
-        # Cruce por código exacto
         apu          = bd_entidad.get(code)
         metodo_cruce = 'Código exacto'
 
-        # Cruce por descripción si no hay match
         if not apu:
             desc_prop = _normalizar(item_prop['description'])
             mejor_sim = 0.0; mejor_key = None
@@ -514,7 +556,6 @@ def cruzar_y_ajustar(propuesta, bd_entidad):
             else:
                 metodo_cruce = 'Sin match'
 
-        # Sin APU → marcar rojo
         if not apu:
             items_sin_apu.append({
                 **item_prop,
@@ -529,7 +570,6 @@ def cruzar_y_ajustar(propuesta, bd_entidad):
             }
             continue
 
-        # Con APU: copiar componentes y ajustar rendimiento MO
         aiu_factor  = max(float(apu.get('aiu_factor', 1.0)), 1.0)
         cd_objetivo = round(precio / aiu_factor, 10)
 
@@ -571,96 +611,163 @@ def cruzar_y_ajustar(propuesta, bd_entidad):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# GENERACIÓN DEL EXCEL
+# GENERACIÓN DEL EXCEL — formato corregido
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _brd_todos():
+    """Border con los 4 lados en todos los bordes."""
+    thin = Side(style='thin')
+    return Border(left=thin, right=thin, top=thin, bottom=thin)
+
+
+def _aplicar_fila(ws, fila, cols_vals, brd, estilos_extra=None):
+    """
+    Aplica valor, borde y estilos a las celdas indicadas.
+    cols_vals: list[(col_letra, valor, font, alignment, fill, number_format)]
+    Garantiza que TODAS las columnas A-H tengan borde.
+    """
+    # Primero poner borde a todas las columnas aunque estén vacías
+    for col in 'ABCDEFGH':
+        ws[f'{col}{fila}'].border = brd
+    # Luego aplicar los valores y estilos
+    for item in cols_vals:
+        col = item[0]; val = item[1]
+        font = item[2] if len(item) > 2 else None
+        aln  = item[3] if len(item) > 3 else None
+        fill = item[4] if len(item) > 4 else None
+        fmt  = item[5] if len(item) > 5 else None
+        c = ws[f'{col}{fila}']
+        c.value  = val
+        c.border = brd
+        if font: c.font      = font
+        if aln:  c.alignment = aln
+        if fill: c.fill      = fill
+        if fmt:  c.number_format = fmt
+
 
 def _build_apu_sheet(ws, item, sin_componentes=False):
     """
     Construye la hoja APU de un ítem.
-    Estructura: MATERIALES → HERRAMIENTAS → TRANSPORTE → MANO DE OBRA
-                COSTO DIRECTO → A.I.U. (si factor > 1) → PRECIO UNITARIO → LETRAS
+    PRECIO UNITARIO es una fórmula (=COSTO DIRECTO + AIU).
+    Todas las celdas tienen bordes en los 4 lados.
+    Columnas con ancho suficiente para descripciones completas.
     """
     bold9  = Font(bold=True,  name='Arial', size=9)
     norm9  = Font(bold=False, name='Arial', size=9)
-    thin   = Side(style='thin')
-    brd    = Border(left=thin, right=thin, top=thin, bottom=thin)
+    brd    = _brd_todos()
     center = Alignment(horizontal='center', vertical='center', wrap_text=True)
     left_w = Alignment(horizontal='left',   vertical='center', wrap_text=True)
     right  = Alignment(horizontal='right',  vertical='center')
     gray   = PatternFill('solid', fgColor='D9D9D9')
     blue   = PatternFill('solid', fgColor='BDD7EE')
     rojo   = PatternFill('solid', fgColor='FCE4D6')
+    gold   = PatternFill('solid', fgColor='FFF2CC')
     CUR    = '$ #,##0.00'
 
     fill_base = rojo if sin_componentes else gray
     fill_pu   = rojo if sin_componentes else blue
 
-    for col, w in zip('ABCDEFGH', [38, 4, 4, 4, 14, 10, 15, 15]):
-        ws.column_dimensions[col].width = w
+    # ── Anchos de columna (descripción visible completa) ─────────────────────
+    ws.column_dimensions['A'].width = 45   # descripción principal
+    ws.column_dimensions['B'].width = 5
+    ws.column_dimensions['C'].width = 5
+    ws.column_dimensions['D'].width = 5
+    ws.column_dimensions['E'].width = 12   # unidad
+    ws.column_dimensions['F'].width = 14   # rendimiento / %
+    ws.column_dimensions['G'].width = 16   # VR unitario
+    ws.column_dimensions['H'].width = 16   # VR total
 
     r = 1
 
-    # Cabecera
-    ws.row_dimensions[r].height = 35
+    # ── Cabecera: descripción / unidad / código ───────────────────────────────
+    ws.row_dimensions[r].height = 40
     ws.merge_cells(f'A{r}:C{r}')
-    for col, val, al in [
-        ('A', 'DESCRIPCIÓN',       center),
-        ('D', item['description'], left_w),
-        ('E', 'UNIDAD',            center),
-        ('F', item['unit'],        center),
-        ('G', 'ITEM',              center),
-        ('H', item['code'],        center),
+    ws.merge_cells(f'D{r}:E{r}')
+    ws.merge_cells(f'F{r}:H{r}')  # unidad y código en la misma banda
+    for col, val, al, fill in [
+        ('A', 'DESCRIPCIÓN',       center, fill_base),
+        ('D', item['description'], left_w, fill_base),
+        ('F', '',                  center, fill_base),  # espacio
     ]:
         ws[f'{col}{r}'] = val
         ws[f'{col}{r}'].font = bold9; ws[f'{col}{r}'].alignment = al
+        ws[f'{col}{r}'].border = brd; ws[f'{col}{r}'].fill = fill
+    # Segunda fila de cabecera: unidad y código
+    r += 1
+    ws.row_dimensions[r].height = 20
+    ws.merge_cells(f'A{r}:C{r}')
+    ws.merge_cells(f'D{r}:E{r}')
+    for col, val, al, fill in [
+        ('A', 'UNIDAD',    center, fill_base),
+        ('D', item['unit'], center, fill_base),
+        ('F', 'ITEM',      center, fill_base),
+        ('G', item['code'], center, fill_base),
+        ('H', '',          center, fill_base),
+    ]:
+        ws[f'{col}{r}'] = val
+        ws[f'{col}{r}'].font = bold9; ws[f'{col}{r}'].alignment = al
+        ws[f'{col}{r}'].border = brd; ws[f'{col}{r}'].fill = fill
+    for col in 'BH':
         ws[f'{col}{r}'].border = brd; ws[f'{col}{r}'].fill = fill_base
     r += 1
 
+    # ── Función para escribir una sección ─────────────────────────────────────
     def write_section(titulo, col_header, componentes):
         nonlocal r
-        ws.row_dimensions[r].height = 14
+
+        # Título de sección
+        ws.row_dimensions[r].height = 15
         ws.merge_cells(f'A{r}:H{r}')
         ws[f'A{r}'] = titulo
         ws[f'A{r}'].font = bold9; ws[f'A{r}'].alignment = center
         ws[f'A{r}'].fill = fill_base; ws[f'A{r}'].border = brd
+        for col in 'BCDEFGH':
+            ws[f'{col}{r}'].border = brd; ws[f'{col}{r}'].fill = fill_base
         r += 1
 
-        ws.row_dimensions[r].height = 14
-        ws.merge_cells(f'A{r}:D{r}')
-        for col, val in [('A','DESCRIPCION'), ('E','UNIDAD'),
-                         ('F', col_header),   ('G','VR UNIT'), ('H','VR TOTAL')]:
+        # Encabezados de columna
+        ws.row_dimensions[r].height = 15
+        ws.merge_cells(f'A{r}:E{r}')
+        for col, val in [('A','DESCRIPCION'), ('F', col_header), ('G','VR UNIT'), ('H','VR TOTAL')]:
             ws[f'{col}{r}'] = val
             ws[f'{col}{r}'].font = bold9; ws[f'{col}{r}'].alignment = center
+            ws[f'{col}{r}'].border = brd
+        for col in 'BCDE':
             ws[f'{col}{r}'].border = brd
         r += 1
 
         start = r
         n = max(len(componentes), 2)
         for i in range(n):
-            ws.row_dimensions[r].height = 13
+            ws.row_dimensions[r].height = 15
             comp = componentes[i] if i < len(componentes) else None
-            ws.merge_cells(f'A{r}:D{r}')
+            ws.merge_cells(f'A{r}:E{r}')
             if comp:
                 ws[f'A{r}'] = comp['description']
-                ws[f'E{r}'] = comp['unit']
                 ws[f'F{r}'] = round(comp['rend'], 6)
                 ws[f'G{r}'] = round(comp['unit_price'], 2)
                 ws[f'H{r}'] = f'=ROUND(F{r}*G{r},2)'
-            for col, al, fmt in [
-                ('A', left_w, None), ('E', center, None),
-                ('F', right, '#,##0.000000'), ('G', right, CUR), ('H', right, CUR)
-            ]:
-                ws[f'{col}{r}'].font = norm9; ws[f'{col}{r}'].border = brd
-                ws[f'{col}{r}'].alignment = al
-                if fmt: ws[f'{col}{r}'].number_format = fmt
+            # Bordes en todas las celdas
+            for col in 'ABCDE':
+                ws[f'{col}{r}'].border = brd
+            ws[f'A{r}'].font = norm9; ws[f'A{r}'].alignment = left_w
+            ws[f'F{r}'].font = norm9; ws[f'F{r}'].alignment = right
+            ws[f'F{r}'].border = brd; ws[f'F{r}'].number_format = '#,##0.000000'
+            ws[f'G{r}'].font = norm9; ws[f'G{r}'].alignment = right
+            ws[f'G{r}'].border = brd; ws[f'G{r}'].number_format = CUR
+            ws[f'H{r}'].font = norm9; ws[f'H{r}'].alignment = right
+            ws[f'H{r}'].border = brd; ws[f'H{r}'].number_format = CUR
             r += 1
 
         end = r - 1
-        ws.row_dimensions[r].height = 14
+        # Subtotal de sección
+        ws.row_dimensions[r].height = 15
         ws.merge_cells(f'A{r}:G{r}')
         ws[f'A{r}'] = f'SUBTOTAL {titulo}'
         ws[f'A{r}'].font = bold9; ws[f'A{r}'].alignment = right
         ws[f'A{r}'].fill = fill_base; ws[f'A{r}'].border = brd
+        for col in 'BCDEFG':
+            ws[f'{col}{r}'].border = brd; ws[f'{col}{r}'].fill = fill_base
         ws[f'H{r}'] = f'=ROUND(SUM(H{start}:H{end}),2)'
         ws[f'H{r}'].font = bold9; ws[f'H{r}'].alignment = right
         ws[f'H{r}'].fill = fill_base; ws[f'H{r}'].border = brd
@@ -668,74 +775,90 @@ def _build_apu_sheet(ws, item, sin_componentes=False):
         sub = r; r += 1
         return sub
 
-    row_mat = write_section('MATERIALES',               'CANTID.', item['materiales'])
-    row_her = write_section('HERRAMIENTAS Y/O EQUIPOS', 'RENDIM.', item['herramientas'])
-    row_tra = write_section('TRANSPORTE',               'CANTID.', item['transporte'])
-    row_mdo = write_section('MANO DE OBRA',             'RENDIM.', item['mano_de_obra'])
+    row_mat = write_section('MATERIALES',               'RENDIM./CANT.', item['materiales'])
+    row_her = write_section('HERRAMIENTAS Y/O EQUIPOS', 'RENDIM.',        item['herramientas'])
+    row_tra = write_section('TRANSPORTE',               'CANT.',          item['transporte'])
+    row_mdo = write_section('MANO DE OBRA',             'RENDIM.',        item['mano_de_obra'])
 
-    # Costo Directo
-    ws.row_dimensions[r].height = 15
+    # ── COSTO DIRECTO ─────────────────────────────────────────────────────────
+    ws.row_dimensions[r].height = 16
     ws.merge_cells(f'A{r}:G{r}')
     ws[f'A{r}'] = 'COSTO DIRECTO'
     ws[f'A{r}'].font = bold9; ws[f'A{r}'].alignment = right
-    ws[f'A{r}'].fill = gray;  ws[f'A{r}'].border = brd
+    ws[f'A{r}'].fill = gray; ws[f'A{r}'].border = brd
+    for col in 'BCDEFG':
+        ws[f'{col}{r}'].border = brd; ws[f'{col}{r}'].fill = gray
     ws[f'H{r}'] = f'=ROUND(H{row_mat}+H{row_her}+H{row_tra}+H{row_mdo},2)'
     ws[f'H{r}'].font = bold9; ws[f'H{r}'].alignment = right
-    ws[f'H{r}'].fill = gray;  ws[f'H{r}'].border = brd
+    ws[f'H{r}'].fill = gray; ws[f'H{r}'].border = brd
     ws[f'H{r}'].number_format = CUR
     row_cd = r; r += 1
 
-    # A.I.U. (si factor > 1 — leído del archivo de la entidad)
+    # ── A.I.U. (si factor > 1) ────────────────────────────────────────────────
     aiu_factor = item.get('aiu_factor', 1.0)
+    row_aiu    = None
     if aiu_factor > 1.0:
         aiu_pct = round(aiu_factor - 1.0, 6)
-        ws.row_dimensions[r].height = 14
+        ws.row_dimensions[r].height = 15
         ws.merge_cells(f'A{r}:D{r}')
         ws[f'A{r}'] = f'A.I.U.  ({aiu_pct*100:.2f}%)'
         ws[f'A{r}'].font = bold9; ws[f'A{r}'].alignment = left_w; ws[f'A{r}'].border = brd
+        for col in 'BCD':
+            ws[f'{col}{r}'].border = brd
         ws[f'E{r}'] = '%'
         ws[f'E{r}'].font = bold9; ws[f'E{r}'].alignment = center; ws[f'E{r}'].border = brd
         ws[f'F{r}'] = aiu_pct
         ws[f'F{r}'].font = bold9; ws[f'F{r}'].alignment = right
-        ws[f'F{r}'].border = brd; ws[f'F{r}'].number_format = '0.00%'
+        ws[f'F{r}'].border = brd; ws[f'F{r}'].number_format = '0.0000%'
         ws[f'G{r}'].border = brd
         ws[f'H{r}'] = f'=ROUND(H{row_cd}*F{r},2)'
         ws[f'H{r}'].font = bold9; ws[f'H{r}'].alignment = right
         ws[f'H{r}'].border = brd; ws[f'H{r}'].number_format = CUR
-        r += 1
+        row_aiu = r; r += 1
 
-    # Precio Unitario
-    ws.row_dimensions[r].height = 18
+    # ── PRECIO UNITARIO — con fórmula ─────────────────────────────────────────
+    ws.row_dimensions[r].height = 20
     ws.merge_cells(f'A{r}:E{r}')
     ws[f'A{r}'] = 'PRECIO UNITARIO'
     ws[f'A{r}'].font = Font(bold=True, name='Arial', size=10)
     ws[f'A{r}'].alignment = center; ws[f'A{r}'].fill = fill_pu; ws[f'A{r}'].border = brd
+    for col in 'BCDE':
+        ws[f'{col}{r}'].border = brd; ws[f'{col}{r}'].fill = fill_pu
     ws.merge_cells(f'F{r}:H{r}')
-    valor_precio = round(item['valor_ofrecido'], 2)
-    ws[f'F{r}'] = valor_precio
+
+    # Fórmula: CD + AIU o solo CD
+    if row_aiu:
+        formula_pu = f'=ROUND(H{row_cd}+H{row_aiu},2)'
+    else:
+        formula_pu = f'=ROUND(H{row_cd},2)'
+
+    ws[f'F{r}'] = formula_pu
     ws[f'F{r}'].font = Font(bold=True, name='Arial', size=10)
     ws[f'F{r}'].alignment = right; ws[f'F{r}'].fill = fill_pu
     ws[f'F{r}'].border = brd; ws[f'F{r}'].number_format = CUR
-    r += 1
+    for col in 'GH':
+        ws[f'{col}{r}'].border = brd; ws[f'{col}{r}'].fill = fill_pu
+    row_pu = r; r += 1
 
-    # Valor en letras
-    gold = PatternFill('solid', fgColor='FFF2CC')
-    ws.row_dimensions[r].height = 22
+    # ── VALOR EN LETRAS ───────────────────────────────────────────────────────
+    ws.row_dimensions[r].height = 25
     ws.merge_cells(f'A{r}:H{r}')
+    valor_precio = round(item['valor_ofrecido'], 2)
     ws[f'A{r}'] = numero_a_letras(int(round(valor_precio, 0)))
     ws[f'A{r}'].font = Font(bold=True, name='Arial', size=9, italic=True)
     ws[f'A{r}'].alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
     ws[f'A{r}'].fill = gold; ws[f'A{r}'].border = brd
+    for col in 'BCDEFGH':
+        ws[f'{col}{r}'].border = brd; ws[f'{col}{r}'].fill = gold
 
 
 def _build_resumen_sheet(wb, items_ajustados, items_sin_apu):
-    """Crea hoja RESUMEN (primera del workbook)."""
+    """Crea hoja RESUMEN (primera del workbook) con bordes completos."""
     ws = wb.create_sheet(title='RESUMEN', index=0)
 
     bold   = Font(bold=True,  name='Arial', size=9)
     norm   = Font(bold=False, name='Arial', size=9)
-    thin   = Side(style='thin')
-    brd    = Border(left=thin, right=thin, top=thin, bottom=thin)
+    brd    = _brd_todos()
     center = Alignment(horizontal='center', vertical='center', wrap_text=True)
     left   = Alignment(horizontal='left',   vertical='center', wrap_text=True)
     right  = Alignment(horizontal='right',  vertical='center')
@@ -746,13 +869,15 @@ def _build_resumen_sheet(wb, items_ajustados, items_sin_apu):
     blanco = Font(bold=True, name='Arial', size=9, color='FFFFFF')
     CUR    = '$ #,##0.00'
 
-    for col, w in zip('ABCDEFGH', [12, 50, 8, 18, 18, 10, 10, 22]):
+    for col, w in zip('ABCDEFGH', [14, 55, 8, 18, 18, 10, 14, 26]):
         ws.column_dimensions[col].width = w
 
     ws.row_dimensions[1].height = 28
     ws.merge_cells('A1:H1')
     ws['A1'] = 'RESUMEN DE APUs — Gerencia Legal Integral Colombia S.A.S.'
     ws['A1'].font = blanco; ws['A1'].fill = azul; ws['A1'].alignment = center
+    for col in 'BCDEFGH':
+        ws[f'{col}1'].border = brd
 
     ws.row_dimensions[2].height = 30
     for celda, texto in [
@@ -773,11 +898,11 @@ def _build_resumen_sheet(wb, items_ajustados, items_sin_apu):
         precio  = item.get('valor_ofrecido', 0)
         aiu_f   = item.get('aiu_factor', 1.0)
         cd_real = item.get('cd_final', 0) if not es_sin else 0
-        # Verificar cierre: cd × aiu_factor ≈ precio
         precio_calc = round(cd_real * aiu_f, 2) if not es_sin else 0
         cierra  = not es_sin and abs(precio - precio_calc) < 0.05
         fill    = verde if cierra else rojo
         estado  = '✅ Ajustado' if cierra else '🔴 Completar manualmente'
+        met     = item.get('metodo_ajuste', '') if not es_sin else ''
 
         for col, val, al, fmt in [
             ('A', item.get('code',''),        center, None),
@@ -804,29 +929,35 @@ def _build_resumen_sheet(wb, items_ajustados, items_sin_apu):
     ws[f'A{fila}'] = f'TOTAL — {fila - 3} ítems'
     ws[f'A{fila}'].font = bold; ws[f'A{fila}'].fill = gris
     ws[f'A{fila}'].alignment = right; ws[f'A{fila}'].border = brd
+    for col in 'BC':
+        ws[f'{col}{fila}'].border = brd; ws[f'{col}{fila}'].fill = gris
     ws[f'D{fila}'] = total_precio
     ws[f'D{fila}'].font = bold; ws[f'D{fila}'].fill = gris
     ws[f'D{fila}'].alignment = right; ws[f'D{fila}'].border = brd
     ws[f'D{fila}'].number_format = CUR
-    for col in ('E','F','G','H'):
+    for col in 'EFGH':
         ws[f'{col}{fila}'].border = brd; ws[f'{col}{fila}'].fill = gris
 
+    # Leyenda
     fila += 2
     for fill, txt in [
-        (verde, 'Verde — APU ajustado: rendimiento MO calibrado, precio unitario cierra exactamente'),
-        (rojo,  'Rojo  — Sin APU o no viable: ítem para completar manualmente en el Excel'),
+        (verde, 'Verde — APU ajustado: rendimiento MO/Her o precio materiales calibrado'),
+        (rojo,  'Rojo  — Sin APU o no viable: ítem para completar manualmente'),
     ]:
         ws.row_dimensions[fila].height = 14
         ws.merge_cells(f'A{fila}:H{fila}')
         ws[f'A{fila}'] = txt
         ws[f'A{fila}'].font = Font(italic=True, name='Arial', size=8)
         ws[f'A{fila}'].fill = fill; ws[f'A{fila}'].alignment = left
+        ws[f'A{fila}'].border = brd
+        for col in 'BCDEFGH':
+            ws[f'{col}{fila}'].border = brd; ws[f'{col}{fila}'].fill = fill
         fila += 1
 
 
 def generate_apu_excel(items_ajustados, items_sin_apu,
                        include_aiu=False, aiu_pct=0.0, bd_externas=None):
-    """Genera el Excel final con hojas de APU + hoja RESUMEN."""
+    """Genera el Excel final con hojas APU + RESUMEN."""
     wb = Workbook()
     wb.remove(wb.active)
 
