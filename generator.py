@@ -213,13 +213,21 @@ def _leer_apu_columnar(ws_apu):
         uprice = row[6]
         total  = row[8]
 
-        aiu_raw = row[9] if len(row) > 9 else None
-        try:
-            aiu_factor = float(aiu_raw) if (aiu_raw is not None and
-                                             isinstance(aiu_raw, (int, float)) and
-                                             float(aiu_raw) > 1.0) else 1.0
-        except Exception:
-            aiu_factor = 1.0
+        # Factor AIU: buscar en columnas J, K, L (índices 9-11)
+        # Acepta formato factor (>1, ej: 1.3502) o porcentaje (0<x<1, ej: 0.3502)
+        aiu_factor = 1.0
+        for aiu_idx in [9, 10, 11]:
+            aiu_raw = row[aiu_idx] if len(row) > aiu_idx else None
+            if aiu_raw is None:
+                continue
+            try:
+                aiu_v = float(aiu_raw)
+                if aiu_v > 1.0:           # Factor multiplicador (ej: 1.3502)
+                    aiu_factor = aiu_v; break
+                elif 0.01 < aiu_v < 1.0:  # Porcentaje (ej: 0.3502 = 35.02%)
+                    aiu_factor = 1.0 + aiu_v; break
+            except Exception:
+                pass
 
         if not tipo:
             continue
@@ -317,10 +325,33 @@ def _leer_apu_presupuesto_directo(ws):
     return apus
 
 
+def _leer_aiu_global(wb):
+    """
+    Intenta extraer un factor AIU global del workbook buscando:
+      - Hoja AU / AIU / A.I.U que tenga un número > 1 en sus celdas
+      - Celda con el texto 'SOLVER' o 'FACTOR' cerca de un número > 1
+    Retorna float (factor) o 1.0 si no encuentra nada.
+    """
+    for nombre in wb.sheetnames:
+        n = nombre.upper().strip()
+        if any(x in n for x in ('AU', 'AIU', 'A.I.U', 'UTILIDAD', 'INDIRECTO', 'GASTOS')):
+            ws = wb[nombre]
+            for row in ws.iter_rows(min_row=1, max_row=ws.max_row, values_only=True):
+                for val in row:
+                    if isinstance(val, (int, float)) and 1.01 < val < 3.0:
+                        return float(val)
+    return 1.0
+
+
 def leer_apu_entidad(archivo):
     """
     Lee el archivo Excel de APUs de la entidad.
-    Combina todos los métodos de lectura.
+    Intenta todos los formatos conocidos en orden de prioridad:
+      1. Hojas individuales 'APU X.XX' (formato SENA/Gobernación)
+      2. Hoja columnar 'APU' con CODINS='-' (formato CIMM/COMM) — lee AIU por ítem
+      3. APUs embebidos con señal textual 'ANALISIS DE PRECIOS UNITARIOS - APU'
+      4. Hoja RESUMEN del output propio de la app (para re-procesar)
+    Para formatos 1 y 3, intenta leer el AIU global desde hoja AU/AIU si existe.
     Retorna: (dict{codigo → apu_dict}, error_str | None)
     """
     try:
@@ -332,11 +363,19 @@ def leer_apu_entidad(archivo):
         return {}, f"No se pudo abrir el archivo de APUs de la entidad: {e}"
 
     bd = {}
+
+    # Método 1: hojas individuales 'APU X.XX'
     bd.update(_leer_hojas_apu_individuales(wb))
+
+    # Método 2: hoja columnar (lee AIU por ítem desde col J/K/L)
     for nombre in wb.sheetnames:
         if 'A.P.U' in nombre.upper() or nombre.upper() == 'APU':
             bd.update(_leer_apu_columnar(wb[nombre]))
             break
+
+    # Método 3: APUs embebidos con señal textual
+    # PROTECCIÓN: solo procesar hojas que realmente contienen la señal,
+    # para no activar este método en hojas de resumen o listas.
     for nombre in wb.sheetnames:
         n_up = nombre.upper().strip()
         if n_up.startswith('APU') or 'APU' in n_up:
@@ -344,11 +383,22 @@ def leer_apu_entidad(archivo):
             if apus_pd:
                 bd.update(apus_pd)
 
+    # Si se leyeron APUs con AIU=1.0 (formatos 1 y 3), intentar asignar
+    # el factor AIU global desde la hoja AU si existe en el workbook.
+    sin_aiu = [c for c, a in bd.items() if a.get('aiu_factor', 1.0) <= 1.0]
+    if sin_aiu:
+        aiu_global = _leer_aiu_global(wb)
+        if aiu_global > 1.0:
+            for code in sin_aiu:
+                bd[code]['aiu_factor'] = aiu_global
+
     if not bd:
         return {}, (
-            "No se encontraron APUs en el archivo. "
-            "Verifique que contenga hojas 'APU X.XX', hoja 'A.P.U' columnar "
-            "o APUs en formato de presupuesto directo."
+            "No se encontraron APUs en el archivo de la entidad.  \n"
+            "Formatos aceptados:\n"
+            "  · Hojas con nombre 'APU X.XX' (una por ítem)\n"
+            "  · Hoja 'APU' con formato columnar (CODINS='-')\n"
+            "  · APUs embebidos con señal 'ANALISIS DE PRECIOS UNITARIOS - APU'"
         )
     return bd, None
 
@@ -357,13 +407,20 @@ def leer_apu_entidad(archivo):
 # LECTOR DE PROPUESTA ECONÓMICA
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Firma única que identifica el output de esta app (aparece en A1)
+_FIRMA_APP = 'RESUMEN DE APUs'
+
 def _leer_resumen_propio(wb):
     """
-    Detecta si el workbook es un output previo de esta app (tiene hoja RESUMEN
-    con encabezado 'PRECIO OFRECIDO' en col D) y lee los ítems desde allí.
+    Detecta si el workbook es un output previo de esta app y lee los ítems.
+    Para ser output propio debe cumplir TODAS estas condiciones:
+      1. Tener hoja llamada 'RESUMEN'
+      2. La celda A1 contiene la firma de la app ('RESUMEN DE APUs')
+      3. La fila 2 tiene el encabezado 'PRECIO OFRECIDO' en alguna columna
+    Este triple filtro evita falsos positivos con archivos de entidades que
+    tengan una hoja llamada 'RESUMEN' por coincidencia.
     Retorna list[dict] o [] si no aplica.
     """
-    # Buscar hoja llamada RESUMEN o RESUMEN DE APUs
     ws_res = None
     for nombre in wb.sheetnames:
         if nombre.strip().upper() == 'RESUMEN':
@@ -371,12 +428,16 @@ def _leer_resumen_propio(wb):
     if ws_res is None:
         return []
 
-    # Verificar que la fila 2 tiene encabezados de la app
+    # Verificar firma en A1 (debe contener el texto de la app)
+    a1 = str(ws_res['A1'].value or '').upper()
+    if _FIRMA_APP.upper() not in a1:
+        return []  # No es output de esta app
+
+    # Verificar encabezado en fila 2
     fila2 = [str(v).upper().strip() if v else '' for v in
              next(ws_res.iter_rows(min_row=2, max_row=2, values_only=True))]
-    # Esperar: ÍTEM, DESCRIPCIÓN, UND., PRECIO OFRECIDO ...
-    tiene_encabezado = any('PRECIO' in c and 'OFRECIDO' in c for c in fila2)
-    if not tiene_encabezado:
+    tiene_precio_ofrecido = any('PRECIO' in c and 'OFRECIDO' in c for c in fila2)
+    if not tiene_precio_ofrecido:
         return []
 
     # Columnas: A=código, B=desc, C=unidad, D=PRECIO OFRECIDO
@@ -428,13 +489,41 @@ def leer_propuesta_economica(archivo):
         return items_resumen, None
 
     # ── Método B: hoja estándar de presupuesto ────────────────────────────────
+    # Priorizar hojas con nombres típicos de presupuesto/formulario/oferta.
+    # Si no, usar el detector genérico. Excluir hojas que parezcan APUs individuales
+    # (nombre corto numérico o empieza con 'APU').
+    NOMBRES_PRESUPUESTO = [
+        'PRESUPUESTO', 'FORMULARIO', 'OFERTA', 'PROPUESTA', 'PROPONENTE',
+        'ACTIVIDADES', 'ITEMS', 'ÍTEMS', 'PRECIOS', 'CANTIDADES', 'OFERTA ECONOMICA',
+        'OFERTA ECONÓMICA', 'PRESUPUESTO OFICIAL', 'BOQ', 'BILL OF QUANTITIES',
+    ]
+    def _es_hoja_presupuesto_probable(nombre):
+        n = nombre.upper().strip()
+        if any(k in n for k in NOMBRES_PRESUPUESTO):
+            return True
+        return False
+    def _es_hoja_apu_individual(nombre):
+        """Verdadero si parece una hoja de APU individual (no queremos leerla como presupuesto)."""
+        n = nombre.strip()
+        # Nombre muy corto o puramente numérico → hoja APU individual
+        if n.replace('.','').replace('-','').isdigit(): return True
+        # Nombre tipo '003.014', '08B.844', etc.
+        if re.match(r'^[0-9A-Za-z]{2,4}\.[0-9]{3,}$', n): return True
+        return False
+
     ws       = _encontrar_hoja_presupuesto(wb)
     fila_enc, mapa = _detectar_columnas(ws)
 
-    if fila_enc is None or 'col_valor' not in mapa:
-        for nombre in wb.sheetnames:
-            if nombre == ws.title:
-                continue
+    # Si la hoja detectada es probablemente un APU individual, buscar mejor candidato
+    if _es_hoja_apu_individual(ws.title) or fila_enc is None or 'col_valor' not in mapa:
+        # Primero las hojas con nombres de presupuesto
+        candidatas = (
+            [n for n in wb.sheetnames if _es_hoja_presupuesto_probable(n)] +
+            [n for n in wb.sheetnames if not _es_hoja_presupuesto_probable(n)
+                                      and not _es_hoja_apu_individual(n)]
+        )
+        for nombre in candidatas:
+            if nombre == ws.title: continue
             ws_alt = wb[nombre]
             fila_alt, mapa_alt = _detectar_columnas(ws_alt)
             if fila_alt is not None and 'col_valor' in mapa_alt:
