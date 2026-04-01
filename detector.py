@@ -1,6 +1,6 @@
 """
 detector.py — Motor de detección universal de presupuestos
-Gerencia Legal Integral Colombia S.A.S. — v1.0
+Gerencia Legal Integral Colombia S.A.S. — v2.0 (col_desc fix)
 """
 import re
 import unicodedata
@@ -97,6 +97,34 @@ def detectar_columnas(ws, max_fila_busqueda=40):
         mapa = {'col_valor': col_valor}
         row_n = [_norm(v) if v else '' for v in row]
 
+        # ── PASO 1: detectar col_desc con dos pasadas ──────────────────────────
+        # Pasada estricta: solo el encabezado que dice exactamente DESCRIPCION/DESCRIPCI
+        # (cubre DESCRIPCIÓN, DESCRIPCION, DESCRIPCION DE ACTIVIDAD, etc.)
+        # Pasada amplia: términos alternativos usados en formatos no estándar
+        # NUNCA incluir 'ESPECIFICACION' — es un encabezado de sección, no de columna
+        _DESC_ESTRICTOS = {'DESCRIPCI'}                          # prefijo cubre todos los casos
+        _DESC_AMPLIOS   = {'ACTIVIDAD', 'CONCEPTO', 'NOMBRE',
+                           'OBJETO', 'RUBRO', 'DENOMINACI',
+                           'DETALLE', 'ITEM DE OBRA'}
+
+        col_desc_estricto = None
+        col_desc_amplio   = None
+
+        for j, n in enumerate(row_n):
+            if j == col_valor or not n: continue
+            if any(p in n for p in _DESC_ESTRICTOS):
+                if col_desc_estricto is None:
+                    col_desc_estricto = j
+            elif any(p in n for p in _DESC_AMPLIOS):
+                if col_desc_amplio is None:
+                    col_desc_amplio = j
+
+        if col_desc_estricto is not None:
+            mapa['col_desc'] = col_desc_estricto
+        elif col_desc_amplio is not None:
+            mapa['col_desc'] = col_desc_amplio
+
+        # ── PASO 2: resto de columnas ──────────────────────────────────────────
         for j, n in enumerate(row_n):
             if j == col_valor: continue
             if not n: continue
@@ -104,11 +132,6 @@ def detectar_columnas(ws, max_fila_busqueda=40):
             if ('VALOR TOTAL' in n or 'VR. PARC' in n or 'VR PARC' in n
                     or 'VR.PARC' in n or 'VALOR PARC' in n or 'VLR TOTAL' in n):
                 mapa.setdefault('col_total', j)
-            elif ('DESCRIPCION' in n or 'DESCRIPCI' in n
-                    or n in ('ACTIVIDAD', 'CONCEPTO', 'NOMBRE', 'ESPECIFICACION',
-                             'ESPECIFICACIONES', 'DETALLE', 'OBJETO', 'RUBRO',
-                             'ITEM DE OBRA', 'DENOMINACION', 'DENOMINACI')):
-                mapa.setdefault('col_desc', j)
             elif ('ITEM DE PAGO' in n or 'ITEM GEN' in n or
                   'ITEM PAGO' in n or 'CODIGO' in n or n == 'ITEM'):
                 mapa.setdefault('col_cod', j)
@@ -116,6 +139,19 @@ def detectar_columnas(ws, max_fila_busqueda=40):
                 mapa.setdefault('col_und', j)
             elif n in ('CANTIDAD','CANT.','CANT','CANT. TOTAL'):
                 mapa.setdefault('col_cant', j)
+
+        # ── VALIDACIÓN: confirmar que col_desc tiene datos reales ──────────────
+        # Si la columna detectada está casi siempre vacía en las filas de datos,
+        # descartar y usar el fallback por contenido.
+        if 'col_desc' in mapa:
+            cd = mapa['col_desc']
+            filas_con_dato = sum(
+                1 for row2 in ws.iter_rows(min_row=i+2, max_row=i+20, values_only=True)
+                if cd < len(row2) and row2[cd] and isinstance(row2[cd], str)
+                   and len(str(row2[cd]).strip()) > 8
+            )
+            if filas_con_dato == 0:
+                del mapa['col_desc']   # falso positivo — descartar
 
         # Si no encontró descripción por nombre, buscar en filas siguientes
         # la columna con textos más largos, priorizando las columnas antes del valor unitario
@@ -151,12 +187,14 @@ def detectar_columnas(ws, max_fila_busqueda=40):
 
 # Patrones de código válidos (ordenados de más específico a más general)
 _RE_CODIGOS = [
-    re.compile(r'^\d{3}\.\d{3}$'),              # CCE: 001.044
+    re.compile(r'^\d{3}\.\d{3}$'),              # CCE estándar: 001.044
     re.compile(r'^\d{3}\.\d{3}\.\d+$'),          # CCE extendido: 001.044.01
+    re.compile(r'^\d+[A-Z]+\.\d+$'),             # Mixto: 08B.844, 08B.845
+    re.compile(r'^[A-Z]+\d*\.\d+$'),             # Letra+num.num: AB.01, A1.01
     re.compile(r'^[A-Z]{2,4}-\d+[A-Z\-]*$'),     # APU-001, APU-002-A
     re.compile(r'^\d+\.\d+\.\d+-[A-Z]+$'),        # 3.1.3-EPC
     re.compile(r'^\d+\.\d+\.\d+$'),               # 3.13.08 / 3.1.1
-    re.compile(r'^\d+\-[A-Z]+$'),                 # 16.2-C
+    re.compile(r'^\d+\-[A-Z]+$'),                 # 16-C
     re.compile(r'^\d+\.\d{2,3}$'),                # 2.16 / 3.01
     re.compile(r'^\d+\.\d+$'),                    # 1.1 / 2.3
 ]
@@ -186,38 +224,50 @@ def es_codigo_item(valor):
 def extraer_codigo(row, mapa):
     """
     Extrae el código del ítem con sistema de prioridades:
-    1. Columna detectada como col_cod
-    2. Columna PARTICULAR (sub-encabezado ESPECIFICACIONES)
-    3. Búsqueda de patrón válido cerca de la descripción
-    4. Número de ítem (float/int como string)
+    1. Columna detectada como col_cod (confianza alta: hallada por nombre de encabezado)
+    2. Búsqueda de patrón válido en columnas cercanas a la descripción
+    3. Número de ítem (float/int como string) — solo como último recurso
     """
     col_cod  = mapa.get('col_cod')
     col_desc = mapa.get('col_desc')
 
-    # Prioridad 1: columna de código detectada
+    # Prioridad 1: columna detectada por nombre de encabezado
+    # Si el encabezado decía "ÍTEM DE PAGO", "CÓDIGO", etc., confiar en ella
+    # aunque el valor no case con los patrones clásicos — puede ser formato nuevo.
+    # Solo rechazamos si el valor es claramente un número de cantidad (entero < 10000
+    # sin ningún punto ni letra) o si está vacío.
     if col_cod is not None and col_cod < len(row):
         val = row[col_cod]
-        if val is not None and str(val).strip() and es_codigo_item(val):
-            return _formatear_codigo(val)
+        if val is not None and str(val).strip():
+            s = str(val).strip()
+            # Descartar si es un entero puro pequeño (probable CANTIDAD, no código)
+            try:
+                num = float(s)
+                if num == int(num) and int(num) < 10000 and '.' not in s:
+                    pass  # es un número entero — no confiar, continuar búsqueda
+                else:
+                    return _formatear_codigo(val)
+            except (ValueError, TypeError):
+                # Es texto alfanumérico → es el código
+                n = _norm(s)
+                if not any(p in n for p in _TEXTOS_NO_CODIGO) and len(s) >= 3:
+                    return _formatear_codigo(val)
 
     # Prioridad 2: buscar patrón válido en columnas cercanas a descripción
     if col_desc is not None:
-        for j in range(max(0, col_desc - 5), col_desc):
+        for j in range(max(0, col_desc - 6), col_desc):
             if j < len(row) and es_codigo_item(row[j]):
                 return _formatear_codigo(row[j])
-        # También revisar columnas después (algunos formatos ponen código después de desc)
         for j in range(col_desc + 1, min(col_desc + 4, len(row))):
             if j < len(row) and es_codigo_item(row[j]):
                 return _formatear_codigo(row[j])
 
-    # Prioridad 3: número de ítem como código
+    # Prioridad 3: número de ítem como código (último recurso)
     for j, val in enumerate(row):
         if isinstance(val, float) and 0 < val < 10000:
             s = f"{val:.4f}".rstrip('0').rstrip('.')
             if re.match(r'^\d+\.\d+$', s):
                 return s
-        elif isinstance(val, int) and 0 < val < 10000:
-            return str(val)
 
     return 'SIN_CODIGO'
 
