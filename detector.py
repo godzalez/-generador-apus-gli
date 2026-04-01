@@ -224,34 +224,36 @@ def es_codigo_item(valor):
 def extraer_codigo(row, mapa):
     """
     Extrae el código del ítem con sistema de prioridades:
-    1. Columna detectada como col_cod (confianza alta: hallada por nombre de encabezado)
+    1. Columna col_cod detectada por nombre de encabezado
     2. Búsqueda de patrón válido en columnas cercanas a la descripción
-    3. Número de ítem (float/int como string) — solo como último recurso
+    3. Float/int como código (último recurso)
     """
     col_cod  = mapa.get('col_cod')
     col_desc = mapa.get('col_desc')
 
     # Prioridad 1: columna detectada por nombre de encabezado
-    # Si el encabezado decía "ÍTEM DE PAGO", "CÓDIGO", etc., confiar en ella
-    # aunque el valor no case con los patrones clásicos — puede ser formato nuevo.
-    # Solo rechazamos si el valor es claramente un número de cantidad (entero < 10000
-    # sin ningún punto ni letra) o si está vacío.
     if col_cod is not None and col_cod < len(row):
         val = row[col_cod]
-        if val is not None and str(val).strip():
+        if val is not None:
             s = str(val).strip()
-            # Descartar si es un entero puro pequeño (probable CANTIDAD, no código)
-            try:
-                num = float(s)
-                if num == int(num) and int(num) < 10000 and '.' not in s:
-                    pass  # es un número entero — no confiar, continuar búsqueda
-                else:
-                    return _formatear_codigo(val)
-            except (ValueError, TypeError):
-                # Es texto alfanumérico → es el código
-                n = _norm(s)
-                if not any(p in n for p in _TEXTOS_NO_CODIGO) and len(s) >= 3:
-                    return _formatear_codigo(val)
+            if s:
+                # Si es texto alfanumérico (no solo dígitos): confiar directamente
+                # Ej: '08B.844', '003.014', '2.16', 'APU-001'
+                try:
+                    float(s)
+                    # Es numérico — solo aceptar si tiene punto (ej: 2.16)
+                    # y no es demasiado grande (distinguir código de cantidad)
+                    if '.' in s:
+                        n = _norm(s)
+                        if not any(p in n for p in _TEXTOS_NO_CODIGO):
+                            return _formatear_codigo(val)
+                    # Si es entero puro → puede ser CANTIDAD, no código
+                    # continuar a búsqueda alternativa
+                except ValueError:
+                    # No es número → es texto alfanumérico → ES el código
+                    n = _norm(s)
+                    if not any(p in n for p in _TEXTOS_NO_CODIGO) and len(s) >= 3:
+                        return _formatear_codigo(val)
 
     # Prioridad 2: buscar patrón válido en columnas cercanas a descripción
     if col_desc is not None:
@@ -262,7 +264,7 @@ def extraer_codigo(row, mapa):
             if j < len(row) and es_codigo_item(row[j]):
                 return _formatear_codigo(row[j])
 
-    # Prioridad 3: número de ítem como código (último recurso)
+    # Prioridad 3: float con punto (ej: 2.16 almacenado como float)
     for j, val in enumerate(row):
         if isinstance(val, float) and 0 < val < 10000:
             s = f"{val:.4f}".rstrip('0').rstrip('.')

@@ -427,11 +427,11 @@ def leer_oferta_economica(uploaded_file, bd_referencia=None):
             bd_interna.update(_leer_hoja_apu_columnar(wb[nombre]))
             break
 
-    # ── Combinar fuentes: interna + referencia externa ────────────────────────
+    # ── Combinar fuentes ──────────────────────────────────────────────────────
     bd_ext = bd_referencia or {}
     bd_combinada = {**bd_ext, **bd_interna}  # interna tiene prioridad
 
-    # ── Cruzar y escalar ──────────────────────────────────────────────────────
+    # ── Cruzar y escalar con reglas de prioridad ──────────────────────────────
     for code, item in items_proceso.items():
         apu = bd_combinada.get(code)
         if not apu:
@@ -439,29 +439,79 @@ def leer_oferta_economica(uploaded_file, bd_referencia=None):
         ref = apu['total_referencia']
         if ref <= 0:
             continue
-        factor = item['valor_ofrecido'] / ref
-        for sec in ('materiales','herramientas','transporte','mano_de_obra'):
-            item[sec] = [
-                {**c,
-                 'unit_price': max(0, int(round(c['unit_price'] * factor, 0))),
-                 'parcial':    max(0, round(c['rend'] * c['unit_price'] * factor, 0))}
-                for c in apu[sec]
-            ]
+
+        ofrecido = item['valor_ofrecido']
+        delta    = ofrecido - ref          # positivo: ofrece más; negativo: ofrece menos
+
+        # Copiar componentes de referencia (UNITARIO intacto — tarifa oficial)
+        for sec in ('materiales', 'herramientas', 'transporte', 'mano_de_obra'):
+            item[sec] = [dict(c) for c in apu[sec]]
+
+        # Calcular totales por sección
+        def _total_sec(comps):
+            return sum(c['rend'] * c['unit_price'] for c in comps
+                       if c['unit_price'] > 0 and c['rend'] > 0)
+
+        mo_ref    = _total_sec(item['mano_de_obra'])
+        equip_ref = _total_sec(item['herramientas']) + _total_sec(item['transporte'])
+        mat_ref   = _total_sec(item['materiales'])
+
+        delta_restante = delta
+
+        # ── Regla 1: ajustar REND de mano de obra primero ────────────────────
+        if mo_ref > 0 and delta_restante != 0:
+            mo_nuevo = mo_ref + delta_restante
+            mo_min   = mo_ref * 0.30   # mínimo: 30% del rendimiento original
+            mo_max   = mo_ref * 2.50   # máximo: 250% del rendimiento original
+            mo_nuevo = max(mo_min, min(mo_max, mo_nuevo))
+            factor_mo = mo_nuevo / mo_ref
+            for c in item['mano_de_obra']:
+                if c['unit_price'] > 0 and c['rend'] > 0:
+                    c['rend'] = round(c['rend'] * factor_mo, 6)
+            delta_restante -= (mo_nuevo - mo_ref)
+
+        # ── Regla 2: si queda diferencia, ajustar REND de equipos/herramienta ─
+        if equip_ref > 0 and abs(delta_restante) > 1:
+            equip_nuevo = equip_ref + delta_restante
+            equip_min   = equip_ref * 0.20
+            equip_max   = equip_ref * 3.00
+            equip_nuevo = max(equip_min, min(equip_max, equip_nuevo))
+            factor_eq   = equip_nuevo / equip_ref
+            for sec in ('herramientas', 'transporte'):
+                for c in item[sec]:
+                    if c['unit_price'] > 0 and c['rend'] > 0:
+                        c['rend'] = round(c['rend'] * factor_eq, 6)
+            delta_restante -= (equip_nuevo - equip_ref)
+
+        # ── Regla 3 (último recurso): ajustar UNITARIO de materiales ─────────
+        if mat_ref > 0 and abs(delta_restante) > 1:
+            mat_nuevo = mat_ref + delta_restante
+            mat_min   = mat_ref * 0.60
+            mat_max   = mat_ref * 1.60
+            mat_nuevo = max(mat_min, min(mat_max, mat_nuevo))
+            factor_mat = mat_nuevo / mat_ref
+            for c in item['materiales']:
+                if c['unit_price'] > 0 and c['rend'] > 0:
+                    # Para materiales: ajustar UNITARIO (precio de mercado)
+                    c['unit_price'] = max(1, int(round(c['unit_price'] * factor_mat, 0)))
+
+        # Recalcular parciales con los valores finales
+        for sec in ('materiales', 'herramientas', 'transporte', 'mano_de_obra'):
+            for c in item[sec]:
+                c['parcial'] = round(c['rend'] * c['unit_price'], 0)
+
         item['tiene_apu'] = True
 
-        # ── Validar mano de obra: detectar si quedó extremadamente baja o en cero ──
-        mo_items = item.get('mano_de_obra', [])
-        total_mo = sum(c['rend'] * c['unit_price'] for c in mo_items)
+        # ── Diagnóstico de mano de obra ───────────────────────────────────────
+        mo_final   = sum(c['rend'] * c['unit_price'] for c in item['mano_de_obra'])
         total_comp = sum(
             c['rend'] * c['unit_price']
             for sec in ('materiales','herramientas','transporte','mano_de_obra')
             for c in item.get(sec, [])
         )
-        pct_mo = (total_mo / total_comp * 100) if total_comp > 0 else 0
-        item['alerta_mo'] = (pct_mo < 5 and len(mo_items) > 0) or any(
-            c['unit_price'] <= 0 for c in mo_items
-        )
-        item['pct_mo'] = round(pct_mo, 1)
+        pct_mo = (mo_final / total_comp * 100) if total_comp > 0 else 0
+        item['alerta_mo'] = (pct_mo < 5 and len(item['mano_de_obra']) > 0)
+        item['pct_mo']    = round(pct_mo, 1)
 
     con_apu = [i for i in items_proceso.values() if i['tiene_apu']]
     sin_apu = [i for i in items_proceso.values() if not i['tiene_apu']]
@@ -843,65 +893,169 @@ def _build_resumen_sheet(wb, items_generados):
         ws[f'A{fila}'].alignment = left
         fila += 1
 
+def _build_apu_columnar_sheet(wb, items, factor_aiu=1.0):
+    """
+    Genera la hoja APU en formato columnar idéntico al de la entidad:
+    CODIGO | CODINS | INSUMO | TIPO | UNIDAD | REND | UNITARIO | VR.PARCIAL | VR.TOTAL
+    Fila de actividad: bold. Filas de componentes: normal.
+    """
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    ws = wb.create_sheet(title='APU')
+
+    # ── Estilos ───────────────────────────────────────────────────────────────
+    thin     = Side(style='thin')
+    brd      = Border(left=thin, right=thin, top=thin, bottom=thin)
+    bold9    = Font(bold=True,  name='Arial', size=9)
+    norm9    = Font(bold=False, name='Arial', size=9)
+    gris     = PatternFill('solid', fgColor='D9D9D9')
+    azul_h   = PatternFill('solid', fgColor='BDD7EE')
+    center   = Alignment(horizontal='center', vertical='center', wrap_text=True)
+    left_w   = Alignment(horizontal='left',   vertical='center', wrap_text=True)
+    right    = Alignment(horizontal='right',  vertical='center')
+    CUR      = '$ #,##0'
+    REND_FMT = '#,##0.0000'
+
+    # ── Anchos de columna (idénticos a la entidad) ────────────────────────────
+    anchos = {'A':11.14,'B':7.43,'C':64.14,'D':13.86,
+              'E':11.71,'F':10.0,'G':15.29,'H':15.29,'I':15.43}
+    for col, w in anchos.items():
+        ws.column_dimensions[col].width = w
+
+    # ── Fila 1: encabezados de columna ───────────────────────────────────────
+    encabezados = [
+        ('A','CODIGO'),('B','CODINS'),('C','INSUMO / DESCRIPCIÓN'),
+        ('D','TIPO'),('E','UNIDAD'),('F','REND'),
+        ('G','UNITARIO'),('H','VR. PARCIAL'),('I','VR. TOTAL'),
+    ]
+    ws.row_dimensions[1].height = 22
+    for col, txt in encabezados:
+        c = ws[f'{col}1']
+        c.value     = txt
+        c.font      = bold9
+        c.fill      = gris
+        c.alignment = center
+        c.border    = brd
+
+    # ── Datos ─────────────────────────────────────────────────────────────────
+    # Mapa TIPO por sección interna
+    TIPO_MAP = {
+        'mano_de_obra': 'Cuadrilla',
+        'herramientas': 'Equipos',
+        'transporte':   'Transporte',
+        'materiales':   'Insumos',
+    }
+    SECCIONES = ('mano_de_obra','herramientas','transporte','materiales')
+
+    fila = 2
+    for item in items:
+        precio_ofrecido = item.get('valor_ofrecido', 0)
+
+        # ── Fila de actividad (encabezado del APU) ────────────────────────────
+        ws.row_dimensions[fila].height = 20
+        vals_act = [
+            ('A', item['code'],        center),
+            ('B', '-',                 center),
+            ('C', item['description'], left_w),
+            ('D', 'Actividad',         center),
+            ('E', item.get('unit',''), center),
+            ('F', '',                  center),
+            ('G', '',                  center),
+            ('H', '',                  center),
+            ('I', int(round(precio_ofrecido, 0)), right),
+        ]
+        for col, val, aln in vals_act:
+            c = ws[f'{col}{fila}']
+            c.value     = val
+            c.font      = bold9
+            c.fill      = azul_h
+            c.alignment = aln
+            c.border    = brd
+        ws[f'I{fila}'].number_format = CUR
+        fila += 1
+
+        # ── Filas de componentes ──────────────────────────────────────────────
+        for sec in SECCIONES:
+            for comp in item.get(sec, []):
+                if comp.get('unit_price', 0) == 0 and comp.get('rend', 0) == 0:
+                    continue   # componente en cero → se omite en el output
+                ws.row_dimensions[fila].height = 14
+                rend  = round(comp.get('rend', 0), 6)
+                up    = comp.get('unit_price', 0)
+                parc  = round(rend * up, 0)
+                vals_comp = [
+                    ('A', item['code'],          center),
+                    ('B', '',                    center),
+                    ('C', comp['description'],   left_w),
+                    ('D', TIPO_MAP[sec],         center),
+                    ('E', comp.get('unit',''),   center),
+                    ('F', rend,                  right),
+                    ('G', int(round(up, 0)),     right),
+                    ('H', int(parc),             right),
+                    ('I', '',                    center),
+                ]
+                for col, val, aln in vals_comp:
+                    c = ws[f'{col}{fila}']
+                    c.value     = val
+                    c.font      = norm9
+                    c.alignment = aln
+                    c.border    = brd
+                ws[f'F{fila}'].number_format = REND_FMT
+                ws[f'G{fila}'].number_format = CUR
+                ws[f'H{fila}'].number_format = CUR
+                fila += 1
+
+    # ── Fila final: total general ─────────────────────────────────────────────
+    ws.row_dimensions[fila].height = 18
+    ws.merge_cells(f'A{fila}:H{fila}')
+    ws[f'A{fila}'] = f'TOTAL COSTO DIRECTO — {len(items)} ítems'
+    ws[f'A{fila}'].font      = bold9
+    ws[f'A{fila}'].fill      = gris
+    ws[f'A{fila}'].alignment = right
+    ws[f'A{fila}'].border    = brd
+    total_gral = sum(i.get('valor_ofrecido', 0) for i in items)
+    ws[f'I{fila}'] = int(round(total_gral, 0))
+    ws[f'I{fila}'].font         = bold9
+    ws[f'I{fila}'].fill         = gris
+    ws[f'I{fila}'].alignment    = right
+    ws[f'I{fila}'].border       = brd
+    ws[f'I{fila}'].number_format = CUR
+
+
+
 def generate_apu_excel(resultado, items_manuales=None, include_aiu=False,
                        aiu_pct=0.0, bd_externas=None):
     """
-    Genera el Excel final.
-    bd_externas: lista de dicts cargados desde bases_externas.cargar_base_externa()
+    Genera el Excel final en formato columnar idéntico al de la entidad.
+    Hoja 1: RESUMEN · Hoja 2: APU (columnar)
     """
-    wb = Workbook(); wb.remove(wb.active)
+    wb = Workbook()
+    wb.remove(wb.active)
 
-    # Construir lista completa de ítems
+    # Construir lista completa de ítems aprobados
     todos = list(resultado['items_con_apu']) + (items_manuales or [])
 
-    # Para ítems sin APU, intentar base externa antes de dejar vacío
+    # Ítems sin APU que no fueron procesados manualmente
     sin_apu = resultado['items_sin_apu']
     items_sin_procesar = [i for i in sin_apu
                           if i['code'] not in {x['code'] for x in todos}]
-
-    if bd_externas and items_sin_procesar:
-        for item in items_sin_procesar:
-            mejor = None
-            mejor_pct = 0
-            for bd in bd_externas:
-                resultados = buscar_en_base(
-                    item['description'], item['unit'], bd, top_n=1, umbral_pct=25
-                )
-                if resultados and resultados[0][1] > mejor_pct:
-                    mejor_pct = resultados[0][1]
-                    mejor = resultados[0][2]
-            if mejor:
-                apu_ext = construir_apu_desde_base(mejor, item['valor_ofrecido'])
-                item['materiales']   = apu_ext['materiales']
-                item['herramientas'] = apu_ext['herramientas']
-                item['transporte']   = apu_ext['transporte']
-                item['mano_de_obra'] = apu_ext['mano_de_obra']
-                item['fuente_bd']    = apu_ext['fuente_bd']
-                item['codigo_bd']    = apu_ext['codigo_bd']
-            todos.append(item)
-    else:
-        todos += items_sin_procesar
+    todos += items_sin_procesar
 
     if not todos:
         todos = sin_apu
 
-    # Marcar fuente de los ítems con APU de referencia
-    for item in resultado['items_con_apu']:
-        if 'fuente_bd' not in item:
-            item['fuente_bd'] = ''  # vacío = misma entidad
-
-    # ── Ordenar ítems por código antes de generar (Obs 8) ────────────────────
+    # Ordenar por código
     todos.sort(key=lambda x: _sort_key_codigo(x.get('code', '')))
 
-    # Generar hojas de APU
-    for item in todos:
-        name = _safe_name(item['code'])
-        if name in [s.title for s in wb.worksheets]: name = name[:27] + '_b'
-        ws = wb.create_sheet(title=name)
-        _build_apu_sheet(ws, item, include_aiu, aiu_pct)
+    # Hoja APU columnar (formato entidad) — va primero
+    _build_apu_columnar_sheet(wb, todos)
 
-    # Hoja RESUMEN (se inserta al inicio)
+    # Hoja RESUMEN — se inserta al inicio
     _build_resumen_sheet(wb, todos)
 
-    buf = io.BytesIO(); wb.save(buf); buf.seek(0)
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
     return buf.getvalue()
+
