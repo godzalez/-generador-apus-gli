@@ -300,44 +300,236 @@ Responde ÚNICAMENTE con JSON válido sin texto adicional, sin comillas markdown
                 mo_tag = f" | ⚠️ MO {item['pct_mo']}%" if item.get('alerta_mo') else ""
                 st.markdown(f"**`{item['code']}`** — {item['description'][:55]} | ${precio:,.0f} | {n} comp | {cierra}{mo_tag}")
 
-# ── Generación final ──────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════
+# PANTALLA DE REVISIÓN ANTES DE EXPORTAR
+# ══════════════════════════════════════════════════════════════════
 seccion_num = "6." if sin_apu else "5."
-st.subheader(f"{seccion_num} Generar y descargar APUs")
+st.subheader(f"{seccion_num} Revisión y aprobación de APUs")
+st.caption(
+    "Revise cada ítem antes de exportar. Puede aprobar o rechazar individualmente. "
+    "Solo los ítems **aprobados** se incluirán en el Excel final."
+)
 
+# ── Construir lista unificada de todos los ítems ─────────────────
 items_manuales_final = st.session_state.get('items_ia', [])
-items_sin_procesar = [
+items_sin_procesar   = [
     i for i in sin_apu
     if i['code'] not in {x['code'] for x in items_manuales_final}
 ]
 todos_manuales = items_manuales_final + items_sin_procesar
-n_gen = len(con_apu) + len(todos_manuales)
+
+# Lista maestra de todos los ítems (con_apu + manuales/IA + sin componentes)
+lista_revision = list(con_apu) + todos_manuales
+
+# Marcar fuente de cada ítem
+for item in lista_revision:
+    if 'fuente_revision' not in item:
+        fuente = item.get('fuente_bd', '')
+        n_comp = sum(len(item.get(s,[])) for s in ('materiales','herramientas','transporte','mano_de_obra'))
+        if n_comp == 0:
+            item['fuente_revision'] = 'Sin componentes'
+        elif fuente:
+            item['fuente_revision'] = f'Base externa ({fuente[:30]})'
+        elif item in con_apu:
+            item['fuente_revision'] = 'Referencia propia'
+        else:
+            item['fuente_revision'] = 'IA generado'
+
+if not lista_revision:
+    st.warning("No hay ítems para revisar.")
+    st.stop()
+
+# ── Inicializar estado de aprobación ─────────────────────────────
+if 'aprobacion' not in st.session_state:
+    st.session_state.aprobacion = {}
+
+# Pre-aprobar automáticamente los que tienen referencia propia y cuadran
+for item in lista_revision:
+    code = item['code']
+    if code not in st.session_state.aprobacion:
+        n_comp = sum(len(item.get(s,[])) for s in
+                     ('materiales','herramientas','transporte','mano_de_obra'))
+        precio = item.get('valor_ofrecido', 0)
+        suma   = sum(c['rend']*c['unit_price']
+                     for s in ('materiales','herramientas','transporte','mano_de_obra')
+                     for c in item.get(s, []))
+        cierra = abs(precio - suma) < 2 if precio > 0 else False
+        alerta = item.get('alerta_mo', False)
+        # Auto-aprobar: referencia propia + cierra + sin alerta MO
+        auto_ok = (item.get('fuente_revision') == 'Referencia propia'
+                   and cierra and not alerta and n_comp > 0)
+        st.session_state.aprobacion[code] = auto_ok
+
+# ── Controles globales ────────────────────────────────────────────
+col_ap, col_rec, col_info = st.columns([1, 1, 3])
+with col_ap:
+    if st.button("✅ Aprobar todos", use_container_width=True):
+        for item in lista_revision:
+            st.session_state.aprobacion[item['code']] = True
+        st.rerun()
+with col_rec:
+    if st.button("❌ Rechazar todos", use_container_width=True):
+        for item in lista_revision:
+            st.session_state.aprobacion[item['code']] = False
+        st.rerun()
+with col_info:
+    n_aprobados  = sum(1 for v in st.session_state.aprobacion.values() if v)
+    n_rechazados = len(lista_revision) - n_aprobados
+    st.info(f"**{n_aprobados}** aprobados · **{n_rechazados}** pendientes de {len(lista_revision)} total")
+
+st.divider()
+
+# ── Tabla de revisión ítem por ítem ──────────────────────────────
+SECCIONES = ('materiales','herramientas','transporte','mano_de_obra')
+
+# Agrupar por estado para mostrar pendientes primero
+pendientes = [i for i in lista_revision if not st.session_state.aprobacion.get(i['code'], False)]
+aprobados  = [i for i in lista_revision if st.session_state.aprobacion.get(i['code'], False)]
+
+for grupo_label, grupo_items, expandido in [
+    ("⚠️ Pendientes de revisión", pendientes, True),
+    ("✅ Aprobados",              aprobados,  False),
+]:
+    if not grupo_items:
+        continue
+    with st.expander(f"{grupo_label} — {len(grupo_items)} ítems", expanded=expandido):
+        for item in grupo_items:
+            code    = item['code']
+            precio  = item.get('valor_ofrecido', 0)
+            n_comp  = sum(len(item.get(s,[])) for s in SECCIONES)
+            suma    = sum(c['rend']*c['unit_price']
+                          for s in SECCIONES for c in item.get(s, []))
+            diff    = precio - suma
+            cierra  = abs(diff) < 2
+            alerta_mo = item.get('alerta_mo', False)
+            pct_mo  = item.get('pct_mo', None)
+            fuente  = item.get('fuente_revision', '—')
+            aprobado = st.session_state.aprobacion.get(code, False)
+
+            # Color de borde según estado
+            if not aprobado:
+                borde_color = '#D32F2F' if (not cierra or alerta_mo or n_comp == 0) else '#F57C00'
+            else:
+                borde_color = '#388E3C'
+
+            st.markdown(f"""
+            <div style='border-left:4px solid {borde_color};
+                        padding:6px 12px; margin-bottom:4px;
+                        background:#FAFAFA; border-radius:4px;'>
+                <strong>{code}</strong> &nbsp;·&nbsp;
+                <span style='font-size:0.9em'>{item['description'][:80]}</span><br>
+                <span style='font-size:0.82em; color:#555'>
+                    {item.get('unit','—')} &nbsp;|&nbsp;
+                    <b>${precio:,.0f}</b> &nbsp;|&nbsp;
+                    {n_comp} componentes &nbsp;|&nbsp;
+                    {'✅ Cierra' if cierra else f'⚠️ Diferencia ${abs(diff):,.0f}'} &nbsp;|&nbsp;
+                    {'⚠️ MO ' + str(pct_mo) + '%' if alerta_mo else ''} &nbsp;|&nbsp;
+                    <em>{fuente}</em>
+                </span>
+            </div>
+            """, unsafe_allow_html=True)
+
+            c1, c2, c3 = st.columns([1, 1, 5])
+            with c1:
+                if st.button("✅ Aprobar", key=f"ap_{code}", use_container_width=True):
+                    st.session_state.aprobacion[code] = True
+                    st.rerun()
+            with c2:
+                if st.button("❌ Rechazar", key=f"rec_{code}", use_container_width=True):
+                    st.session_state.aprobacion[code] = False
+                    st.rerun()
+            with c3:
+                # Mostrar componentes desplegables
+                with st.expander(f"Ver componentes ({n_comp})", expanded=False):
+                    if n_comp == 0:
+                        st.warning("Sin componentes — se exportará con estructura vacía.")
+                    else:
+                        for sec in SECCIONES:
+                            comps = item.get(sec, [])
+                            if not comps: continue
+                            st.markdown(f"**{sec.upper().replace('_',' ')}**")
+                            for c in comps:
+                                und  = c.get('unit','') or '⚠️SIN UND'
+                                rend = c.get('rend', 0)
+                                up   = c.get('unit_price', 0)
+                                parc = rend * up
+                                und_color = 'red' if not c.get('unit','') else 'inherit'
+                                st.markdown(
+                                    f"&nbsp;&nbsp;• {c['description']} &nbsp;"
+                                    f"<span style='color:{und_color}'>[{und}]</span> &nbsp;"
+                                    f"rend={rend:.4f} × ${up:,.0f} = **${parc:,.0f}**",
+                                    unsafe_allow_html=True
+                                )
+                            st.markdown("---")
+
+                    # Resumen de cierre
+                    if n_comp > 0:
+                        col_s1, col_s2, col_s3 = st.columns(3)
+                        col_s1.metric("Precio ofrecido", f"${precio:,.0f}")
+                        col_s2.metric("Suma componentes", f"${suma:,.0f}")
+                        col_s3.metric(
+                            "Diferencia",
+                            f"${abs(diff):,.0f}",
+                            delta=f"{'OK' if cierra else 'Revisar'}",
+                            delta_color="normal" if cierra else "inverse"
+                        )
+
+            st.markdown("")  # separador visual
+
+# ══════════════════════════════════════════════════════════════════
+# EXPORTAR SOLO LOS APROBADOS
+# ══════════════════════════════════════════════════════════════════
+st.divider()
+seccion_exp = "7." if sin_apu else "6."
+st.subheader(f"{seccion_exp} Exportar APUs aprobados")
+
+items_aprobados = [i for i in lista_revision
+                   if st.session_state.aprobacion.get(i['code'], False)]
+items_rechazados = [i for i in lista_revision
+                    if not st.session_state.aprobacion.get(i['code'], False)]
+
 aiu_txt = f"con AIU ({aiu_pct*100:.1f}%)" if include_aiu else "sin AIU"
 
-if n_gen == 0:
-    st.warning("No hay ítems para generar.")
+if not items_aprobados:
+    st.warning("⚠️ No hay ítems aprobados. Apruebe al menos uno para exportar.")
 else:
-    if items_sin_procesar:
+    if items_rechazados:
         st.info(
-            f"ℹ️ {len(items_sin_procesar)} ítem(s) se generarán con estructura vacía "
-            "(sin componentes). Puede completarlos manualmente en el Excel descargado."
+            f"ℹ️ Se exportarán **{len(items_aprobados)}** ítems aprobados. "
+            f"**{len(items_rechazados)}** rechazados quedarán fuera del Excel."
         )
+    else:
+        st.success(f"✅ Todos los {len(items_aprobados)} ítems aprobados listos para exportar.")
 
-    if st.button(f"🚀 Generar {n_gen} APU(s) — {aiu_txt}",
-                 type="primary", use_container_width=True):
-        with st.spinner(f"Generando {n_gen} APUs..."):
+    if st.button(
+        f"🚀 Generar Excel — {len(items_aprobados)} APUs aprobados ({aiu_txt})",
+        type="primary", use_container_width=True
+    ):
+        with st.spinner(f"Generando {len(items_aprobados)} APUs..."):
             try:
+                # Separar aprobados en con_apu y manuales para respetar la firma de generate_apu_excel
+                codes_con_apu   = {i['code'] for i in con_apu}
+                aprobados_ref   = [i for i in items_aprobados if i['code'] in codes_con_apu]
+                aprobados_otros = [i for i in items_aprobados if i['code'] not in codes_con_apu]
+
+                resultado_filtrado = {
+                    **resultado,
+                    'items_con_apu': aprobados_ref,
+                    'items_sin_apu': [],
+                }
+
                 excel = generate_apu_excel(
-                    resultado,
-                    items_manuales=todos_manuales if todos_manuales else None,
+                    resultado_filtrado,
+                    items_manuales=aprobados_otros if aprobados_otros else None,
                     include_aiu=include_aiu,
                     aiu_pct=aiu_pct,
                     bd_externas=bds_externas if bds_externas else None,
                 )
-                st.session_state.excel = excel
+                st.session_state.excel  = excel
                 st.session_state.nombre = uploaded_proceso.name.replace('.xlsx','').replace('.xlsm','')
                 st.success(
-                    f"✅ **{n_gen} APUs generados.** "
-                    f"El PRECIO UNITARIO de cada APU cuadra exactamente con su oferta."
+                    f"✅ **{len(items_aprobados)} APUs generados.** "
+                    "Descargue el archivo a continuación."
                 )
             except Exception as e:
                 st.error(f"❌ Error al generar: {e}")
@@ -347,7 +539,8 @@ else:
         st.download_button(
             label="⬇️ Descargar APUs en Excel",
             data=st.session_state.excel,
-            file_name=f"APUs_{st.session_state.nombre}.xlsx",
+            file_name=f"APUs_{st.session_state.get('nombre','export')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True, type="primary",
         )
+
