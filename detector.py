@@ -104,7 +104,10 @@ def detectar_columnas(ws, max_fila_busqueda=40):
             if ('VALOR TOTAL' in n or 'VR. PARC' in n or 'VR PARC' in n
                     or 'VR.PARC' in n or 'VALOR PARC' in n or 'VLR TOTAL' in n):
                 mapa.setdefault('col_total', j)
-            elif ('DESCRIPCION' in n or 'DESCRIPCI' in n):
+            elif ('DESCRIPCION' in n or 'DESCRIPCI' in n
+                    or n in ('ACTIVIDAD', 'CONCEPTO', 'NOMBRE', 'ESPECIFICACION',
+                             'ESPECIFICACIONES', 'DETALLE', 'OBJETO', 'RUBRO',
+                             'ITEM DE OBRA', 'DENOMINACION', 'DENOMINACI')):
                 mapa.setdefault('col_desc', j)
             elif ('ITEM DE PAGO' in n or 'ITEM GEN' in n or
                   'ITEM PAGO' in n or 'CODIGO' in n or n == 'ITEM'):
@@ -115,14 +118,17 @@ def detectar_columnas(ws, max_fila_busqueda=40):
                 mapa.setdefault('col_cant', j)
 
         # Si no encontró descripción por nombre, buscar en filas siguientes
-        # la columna con textos más largos
+        # la columna con textos más largos, priorizando las columnas antes del valor unitario
         if 'col_desc' not in mapa:
+            candidatos = {}  # col_index → longitud_promedio
             for row2 in ws.iter_rows(min_row=i+2, max_row=i+10, values_only=True):
                 for j, val in enumerate(row2):
-                    if val and isinstance(val, str) and len(val.strip()) > 15:
-                        mapa['col_desc'] = j
-                        break
-                if 'col_desc' in mapa: break
+                    if j >= col_valor: continue  # no buscar a la derecha del valor unitario
+                    if val and isinstance(val, str) and len(val.strip()) > 12:
+                        candidatos[j] = candidatos.get(j, 0) + len(val.strip())
+            if candidatos:
+                # Elegir la columna con más texto acumulado (la más "descriptiva")
+                mapa['col_desc'] = max(candidatos, key=candidatos.get)
 
         # Si no encontró código, buscar en columnas justo antes de descripción
         if 'col_cod' not in mapa and 'col_desc' in mapa:

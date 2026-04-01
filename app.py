@@ -1,27 +1,14 @@
 """
 Generador Automático de APUs — Gerencia Legal Integral Colombia S.A.S.
-v11: Textos claros + AIU leído automáticamente del archivo de la entidad.
+v9: fix hoja proponente + generación IA con manejo robusto de errores.
 """
 import streamlit as st
-import sys, traceback
+import pandas as pd
+import json
+import requests
+from generator import leer_oferta_economica, leer_base_datos_apu, generate_apu_excel
+from bases_externas import cargar_base_externa
 
-# ── Import con diagnóstico visible ───────────────────────────────────────────
-try:
-    import pandas as pd
-    from generator import (
-        leer_apu_entidad,
-        leer_propuesta_economica,
-        cruzar_y_ajustar,
-        generate_apu_excel,
-    )
-except Exception as _e:
-    st.set_page_config(page_title="Error – APUs GLI", page_icon="❌")
-    st.error(f"**Error al cargar la aplicación:** `{type(_e).__name__}: {_e}`")
-    st.code(traceback.format_exc(), language="text")
-    st.info(f"Python {sys.version} | sys.path: {sys.path[:3]}")
-    st.stop()
-
-# ─────────────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Generador de APUs – GLI", page_icon="🏗️", layout="wide")
 
 st.markdown("""
@@ -29,270 +16,338 @@ st.markdown("""
         <h2 style='color:white;margin:0'>🏗️ Generador Automático de APUs</h2>
         <p style='color:#BDD7EE;margin:4px 0 0 0'>
         Gerencia Legal Integral Colombia S.A.S. &nbsp;·&nbsp;
-        Ajusta los APUs de la entidad al precio de su propuesta económica.</p>
+        Desglosa cada precio unitario con sus componentes exactos.</p>
     </div>
 """, unsafe_allow_html=True)
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("⚙️ Configuración")
-    st.info(
-        "**AIU automático**  \n"
-        "El factor AIU se lee directamente del archivo de la entidad "
-        "(columna J de la hoja APU). No necesita ingresarlo manualmente."
-    )
-    st.divider()
-    modo_avanzado = st.toggle("🔧 Modo avanzado — bases externas", value=False)
-    if modo_avanzado:
-        st.caption(
-            "Activa la carga de bases de precios externas (Gobernación, INVIAS) "
-            "para completar ítems que no estén en el archivo de la entidad."
-        )
+    include_aiu = st.toggle("Incluir AIU en los APUs", value=False)
+    aiu_pct = 0.0
+    if include_aiu:
+        val = st.number_input("Porcentaje AIU (%)", 0.0, 100.0, 25.0, 0.1, "%.2f")
+        aiu_pct = val / 100.0
+        st.info(f"AIU: **{val:.2f}%**")
+    else:
+        st.success("Sin AIU — precio = costo directo")
     st.divider()
     st.markdown("⚠️ Use descripciones **genéricas** (sin marcas comerciales).")
-    st.caption("v13.0 · GLI Colombia · 2026")
+    st.caption("v9.0 · GLI Colombia · 2026")
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PASO 1 — APUs de la Entidad
-# ══════════════════════════════════════════════════════════════════════════════
-st.markdown("---")
-col_icon, col_title = st.columns([0.06, 0.94])
-col_icon.markdown("## 1️⃣")
-col_title.markdown("## APUs de la Entidad")
-
-st.markdown("""
-> **¿Qué archivo cargar aquí?**  
-> El archivo que **la entidad contratante le entregó** con los análisis de precios unitarios del proceso.  
-> Puede ser **Excel (.xlsx)** o **PDF** — la aplicación detecta el formato automáticamente.  
-> Debe contener los componentes de cada ítem: materiales, equipos, mano de obra y transporte.  
-> La aplicación tomará estos componentes como base y **solo ajustará el rendimiento de la mano de obra**.
-""")
-
-uploaded_entidad = st.file_uploader(
-    "📂 Seleccione el archivo de APUs de la Entidad",
-    type=["xlsx", "xlsm", "pdf"],
-    key="entidad",
-    help="Excel (.xlsx) o PDF con los APUs de la entidad. El sistema detecta el formato automáticamente."
+# ── Paso 1: Archivo del proceso ───────────────────────────────────────────────
+st.subheader("1. Cargue el Excel de la oferta económica del proceso")
+st.caption(
+    "Suba el Excel del proceso — puede ser cualquier formato: PRESUPUESTO, PROPUESTA, "
+    "FORMULARIO, etc. Si el archivo tiene una hoja del proponente con sus precios, "
+    "el software la usará automáticamente."
 )
-if uploaded_entidad:
-    st.success(f"✅ Archivo cargado: **{uploaded_entidad.name}**")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PASO 2 — Mi Propuesta Económica
-# ══════════════════════════════════════════════════════════════════════════════
-st.markdown("---")
-col_icon, col_title = st.columns([0.06, 0.94])
-col_icon.markdown("## 2️⃣")
-col_title.markdown("## Mi Propuesta Económica")
-
-st.markdown("""
-> **¿Qué archivo cargar aquí?**  
-> El formulario o presupuesto con **los precios que usted va a ofrecer** en el proceso.
-> La aplicación ajustará el rendimiento de mano de obra para que cada APU cierre
-> **exactamente** con ese valor (a dos decimales).
-""")
-
-uploaded_propuesta = st.file_uploader(
-    "📂 Seleccione el archivo con su Propuesta Económica",
-    type=["xlsx", "xlsm"],
-    key="propuesta",
-    help="Su formulario de oferta económica con los precios unitarios que va a proponer."
+uploaded_proceso = st.file_uploader(
+    "Excel del proceso (cualquier formato — PRESUPUESTO, PROPUESTA, FORMULARIO, etc.)",
+    type=["xlsx","xlsm"], key="proceso"
 )
-if uploaded_propuesta:
-    st.success(f"✅ Archivo cargado: **{uploaded_propuesta.name}**")
 
+# ── Paso 2: Base de datos de referencia ───────────────────────────────────────
+st.subheader("2. Cargue su base de datos de referencia APU (opcional pero recomendado)")
+st.caption(
+    "Si tiene un archivo de un proceso anterior con hoja APU, cárguelo aquí. "
+    "El software cruzará los códigos y tomará los componentes, ajustando los precios a su oferta actual."
+)
+uploaded_ref = st.file_uploader(
+    "Archivo de referencia con hoja APU",
+    type=["xlsx","xlsm"], key="referencia"
+)
 
-# ══════════════════════════════════════════════════════════════════════════════
-# PASO 3 (Modo avanzado) — Bases externas
-# ══════════════════════════════════════════════════════════════════════════════
+if not uploaded_proceso:
+    st.info("👆 Cargue el Excel del proceso para comenzar.")
+    st.stop()
+
+# ── Leer referencia ───────────────────────────────────────────────────────────
+bd_referencia = {}
+if uploaded_ref:
+    with st.spinner("Leyendo base de datos de referencia..."):
+        bd_ref, err_ref = leer_base_datos_apu(uploaded_ref)
+        if bd_ref:
+            bd_referencia = bd_ref
+            st.success(f"✅ Referencia cargada: **{len(bd_referencia)}** ítems con componentes.")
+        else:
+            st.warning(f"⚠️ Referencia: {err_ref}")
+
+# ── Paso 3: Bases de precios externas ────────────────────────────────────────
+st.subheader("3. Cargue bases de precios externas (Gobernación, INVIAS, etc.)")
+st.caption(
+    "Opcional. Si carga una base de precios (Gobernación de Boyacá, INVIAS u otra), "
+    "el software la usará automáticamente para completar los ítems que no tengan APU de referencia. "
+    "Puede cargar múltiples archivos."
+)
+uploaded_bases = st.file_uploader(
+    "Bases de precios externas (Gobernación de Boyacá, INVIAS, etc.)",
+    type=["xlsx","xlsm"], key="bases_ext", accept_multiple_files=True
+)
+
 bds_externas = []
-if modo_avanzado:
-    st.markdown("---")
-    col_icon, col_title = st.columns([0.06, 0.94])
-    col_icon.markdown("## 3️⃣")
-    col_title.markdown("## Bases de Precios Externas *(opcional)*")
+if uploaded_bases:
+    for ub in uploaded_bases:
+        bd_ext, fmt_ext, err_ext = cargar_base_externa(ub, nombre_fuente=ub.name.replace('.xlsx','').replace('.xlsm',''))
+        if bd_ext:
+            bds_externas.append(bd_ext)
+            st.success(f"✅ **{ub.name}**: {len(bd_ext)} ítems cargados (formato: {fmt_ext})")
+        else:
+            st.warning(f"⚠️ {ub.name}: {err_ext}")
 
-    st.markdown("""
-    > **¿Para qué sirve esto?**  
-    > Si algunos ítems de su propuesta **no están en el archivo de la entidad**, puede cargar
-    > bases de precios de Gobernación de Boyacá, INVIAS u otras para completarlos.
-    > Si no carga nada aquí, esos ítems quedarán en rojo para completar manualmente.
-    """)
+# ── Leer proceso ──────────────────────────────────────────────────────────────
+with st.spinner("Leyendo el archivo del proceso..."):
+    resultado, error = leer_oferta_economica(uploaded_proceso, bd_referencia=bd_referencia)
 
-    uploaded_bases = st.file_uploader(
-        "📂 Seleccione bases de precios externas (puede cargar varios archivos)",
-        type=["xlsx", "xlsm"],
-        key="bases_ext",
-        accept_multiple_files=True,
-    )
-    if uploaded_bases:
-        from bases_externas import cargar_base_externa
-        for ub in uploaded_bases:
-            bd_ext, fmt_ext, err_ext = cargar_base_externa(
-                ub, nombre_fuente=ub.name.replace('.xlsx','').replace('.xlsm','')
-            )
-            if bd_ext:
-                bds_externas.append(bd_ext)
-                st.success(f"✅ **{ub.name}**: {len(bd_ext)} ítems ({fmt_ext})")
-            else:
-                st.warning(f"⚠️ {ub.name}: {err_ext}")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Validación
-# ══════════════════════════════════════════════════════════════════════════════
-if not uploaded_entidad or not uploaded_propuesta:
-    st.markdown("---")
-    faltantes = []
-    if not uploaded_entidad:   faltantes.append("**APUs de la Entidad** (Paso 1)")
-    if not uploaded_propuesta: faltantes.append("**Propuesta Económica** (Paso 2)")
-    st.info(f"👆 Para continuar, cargue: {' y '.join(faltantes)}.")
+if error:
+    st.error(f"❌ {error}")
     st.stop()
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Procesamiento
-# ══════════════════════════════════════════════════════════════════════════════
-st.markdown("---")
-n_paso = 4 if modo_avanzado else 3
-
-with st.spinner("Leyendo APUs de la entidad..."):
-    bd_entidad, err_entidad = leer_apu_entidad(uploaded_entidad)
-
-if err_entidad:
-    st.error(f"❌ No se pudo leer el archivo de APUs de la entidad: {err_entidad}")
-    st.stop()
-
-aiu_values = [v.get('aiu_factor', 1.0) for v in bd_entidad.values() if v.get('aiu_factor', 1.0) > 1.0]
-if aiu_values:
-    aiu_prom   = sum(aiu_values) / len(aiu_values)
-    aiu_unico  = len(set(round(x, 4) for x in aiu_values)) == 1
-    aiu_txt    = f"{(aiu_prom-1)*100:.2f}%" if aiu_unico else f"variable ({(min(aiu_values)-1)*100:.2f}% – {(max(aiu_values)-1)*100:.2f}%)"
-    st.success(f"✅ APUs de la entidad: **{len(bd_entidad)}** ítems  |  Factor AIU detectado: **{aiu_txt}**")
-else:
-    st.success(f"✅ APUs de la entidad: **{len(bd_entidad)}** ítems (sin AIU)")
-
-with st.spinner("Leyendo propuesta económica..."):
-    propuesta, err_prop = leer_propuesta_economica(uploaded_propuesta)
-
-if err_prop:
-    st.error(f"❌ No se pudo leer la propuesta económica: {err_prop}")
-    st.stop()
-
-st.success(f"✅ Propuesta económica: **{len(propuesta)}** ítems leídos")
-
-with st.spinner("Cruzando ítems y ajustando rendimientos de mano de obra..."):
-    resultado = cruzar_y_ajustar(propuesta, bd_entidad)
-
-con_apu = resultado['items_ajustados']
+con_apu = resultado['items_con_apu']
 sin_apu = resultado['items_sin_apu']
-n_total = resultado['total']
-cruces  = resultado['detalle_cruce']
+n_total = resultado['total_proceso']
+hoja    = resultado['hoja_usada']
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Resultado del cruce
-# ══════════════════════════════════════════════════════════════════════════════
-col_icon, col_title = st.columns([0.06, 0.94])
-col_icon.markdown(f"## {n_paso}️⃣")
-col_title.markdown("## Resultado del Cruce")
-n_paso += 1
-
+# ── Resumen ───────────────────────────────────────────────────────────────────
+st.subheader("4. Resumen")
+st.caption(f"Hoja leída: **{hoja}**")
 c1, c2, c3 = st.columns(3)
-c1.metric("Total ítems en propuesta", n_total)
-c2.metric("✅ APUs ajustados",         len(con_apu))
-c3.metric("🔴 Sin APU (completar)",   len(sin_apu))
+c1.metric("Total ítems", n_total)
+c2.metric("Con componentes APU", len(con_apu))
+c3.metric("Sin componentes (requieren IA)", len(sin_apu))
 
 if con_apu:
-    with st.expander(f"✅ Ver los {len(con_apu)} ítems ajustados", expanded=False):
-        filas = []
+    with st.expander(f"✅ {len(con_apu)} ítems con componentes completos", expanded=False):
         for item in con_apu:
-            aiu_f  = item.get('aiu_factor', 1.0)
-            cd     = item.get('cd_final', 0)
-            precio = item['valor_ofrecido']
-            diff   = abs(precio - round(cd * aiu_f, 2))
-            filas.append({
-                'Ítem':          item['code'],
-                'Descripción':   item['description'][:55],
-                'Unidad':        item['unit'],
-                'Precio ($)':    f"${precio:,.2f}",
-                'Costo Directo': f"${cd:,.2f}",
-                'AIU':           f"{(aiu_f-1)*100:.2f}%" if aiu_f > 1 else '—',
-                'Cierre':        "✅" if diff < 0.05 else f"⚠️ dif=${diff:,.2f}",
-                'Ajuste vía':    cruces.get(item['code'], {}).get('metodo_ajuste', ''),
-            })
-        st.dataframe(pd.DataFrame(filas), use_container_width=True, hide_index=True)
+            n = sum(len(item[s]) for s in ('materiales','herramientas','transporte','mano_de_obra'))
+            st.markdown(f"**`{item['code']}`** — {item['description'][:65]} | **${item['valor_ofrecido']:,.0f}** | {n} componentes")
+
+# ── IA para ítems sin componentes ─────────────────────────────────────────────
+items_ia = []
 
 if sin_apu:
-    with st.expander(
-        f"🔴 {len(sin_apu)} ítems que quedarán en ROJO — completar manualmente",
-        expanded=True
-    ):
-        st.warning(
-            "Estos ítems no se encontraron en el archivo de APUs de la entidad.  \n"
-            "Se incluirán en el Excel con la hoja **vacía y en rojo**."
-        )
-        filas_r = []
-        for item in sin_apu:
-            info = cruces.get(item['code'], {})
-            filas_r.append({
-                'Ítem':        item['code'],
-                'Descripción': item['description'][:65],
-                'Precio ($)':  f"${item['valor_ofrecido']:,.2f}",
-                'Motivo':      info.get('razon', info.get('metodo', '—')),
-            })
-        st.dataframe(pd.DataFrame(filas_r), use_container_width=True, hide_index=True)
+    st.subheader("5. Generación de componentes con IA")
+    st.markdown(
+        f"Los siguientes **{len(sin_apu)} ítems** no tienen componentes en ninguna fuente disponible. "
+        "Haga clic en **Generar con IA** para que el asistente proponga la desagregación automáticamente."
+    )
 
+    if st.button("🤖 Generar componentes con IA para todos los ítems pendientes",
+                 type="primary", use_container_width=True):
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Generación del Excel
-# ══════════════════════════════════════════════════════════════════════════════
-st.markdown("---")
-col_icon, col_title = st.columns([0.06, 0.94])
-col_icon.markdown(f"## {n_paso}️⃣")
-col_title.markdown("## Generar y Descargar APUs en Excel")
+        progress = st.progress(0, text="Iniciando...")
+        ok_count = 0
+        err_count = 0
+        items_generados = []
 
-n_gen = len(con_apu) + len(sin_apu)
+        for idx, item in enumerate(sin_apu):
+            pct = idx / len(sin_apu)
+            progress.progress(pct, text=f"Procesando [{item['code']}] ({idx+1}/{len(sin_apu)})...")
+
+            precio_total = int(round(item['valor_ofrecido'], 0))
+
+            prompt = f"""Eres un ingeniero civil colombiano experto en presupuestos de obra pública.
+Desagrega el siguiente ítem en sus componentes de COSTO DIRECTO.
+
+ÍTEM: {item['description']}
+UNIDAD DE MEDIDA DEL ÍTEM: {item['unit']}
+PRECIO UNITARIO: ${precio_total:,} COP
+
+REGLAS OBLIGATORIAS:
+1. Descripciones GENÉRICAS sin marcas comerciales.
+2. La suma exacta de (rend × unit_price) de TODOS los componentes debe ser {precio_total}.
+3. Clasifica cada componente en: materiales, herramientas, mano_de_obra o transporte.
+4. UNIDADES colombianas para cada componente (campo "unit"): M3, M2, ML, KG, GL, UND, HR, DIA, M3-KM, TON, VJE. NUNCA dejes "unit" vacío.
+5. unit_price debe ser un número ENTERO (sin decimales).
+6. Rendimientos coherentes con la unidad del ítem ({item['unit']}).
+7. Mínimo 2 componentes, máximo 8.
+8. La MANO DE OBRA debe representar al menos el 15% del total (no puede quedar en cero ni negativa).
+
+Responde ÚNICAMENTE con JSON válido sin texto adicional, sin comillas markdown:
+{{"materiales":[{{"description":"nombre genérico","unit":"UND","rend":0.5,"unit_price":10000}}],"herramientas":[{{"description":"nombre","unit":"HR","rend":0.1,"unit_price":5000}}],"mano_de_obra":[{{"description":"cuadrilla nombre","unit":"DIA","rend":0.4,"unit_price":45000}}],"transporte":[]}}"""
+
+            try:
+                # Obtener API key: primero de Streamlit Secrets (nube), luego de variable local
+                import os
+                api_key = None
+                try:
+                    api_key = st.secrets.get("ANTHROPIC_API_KEY", None)
+                except Exception:
+                    pass
+                if not api_key:
+                    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+
+                headers_api = {"Content-Type": "application/json"}
+                if api_key:
+                    headers_api["x-api-key"] = api_key
+
+                response = requests.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers=headers_api,
+                    json={
+                        "model": "claude-sonnet-4-20250514",
+                        "max_tokens": 1000,
+                        "messages": [{"role": "user", "content": prompt}]
+                    },
+                    timeout=45
+                )
+
+                if response.status_code == 401:
+                    st.error(
+                        "❌ **Error de autenticación con la API de IA.** "
+                        "La generación automática de componentes requiere conexión a internet "
+                        "y acceso a la API de Anthropic. "
+                        "Verifique su conexión o ingrese los componentes manualmente en la sección siguiente."
+                    )
+                    break
+
+                if response.status_code != 200:
+                    err_count += 1
+                    items_generados.append(item)
+                    continue
+
+                data = response.json()
+                if 'error' in data:
+                    err_count += 1
+                    items_generados.append(item)
+                    continue
+
+                texto = data['content'][0]['text'].strip()
+
+                # Limpiar backticks si los hay
+                if '```' in texto:
+                    partes = texto.split('```')
+                    for p in partes:
+                        p = p.strip()
+                        if p.startswith('json'):
+                            p = p[4:]
+                        if p.startswith('{'):
+                            texto = p
+                            break
+
+                componentes = json.loads(texto)
+
+                # Ajustar para que sume exactamente el precio
+                total_comp = sum(
+                    c['rend'] * c['unit_price']
+                    for sec in ('materiales','herramientas','mano_de_obra','transporte')
+                    for c in componentes.get(sec, [])
+                )
+                diferencia = precio_total - total_comp
+
+                if abs(diferencia) > 1:
+                    # Ajustar el último componente de mano_de_obra o materiales
+                    for sec in ('mano_de_obra','materiales','herramientas'):
+                        comps = componentes.get(sec, [])
+                        if comps and comps[-1]['rend'] > 0:
+                            comps[-1]['unit_price'] = round(
+                                comps[-1]['unit_price'] + diferencia / comps[-1]['rend'], 2
+                            )
+                            break
+
+                item_generado = {
+                    **item,
+                    'materiales':   componentes.get('materiales', []),
+                    'herramientas': componentes.get('herramientas', []),
+                    'mano_de_obra': componentes.get('mano_de_obra', []),
+                    'transporte':   componentes.get('transporte', []),
+                    'tiene_apu':    True,
+                }
+                items_generados.append(item_generado)
+                ok_count += 1
+
+            except json.JSONDecodeError:
+                # JSON inválido — guardar sin componentes
+                items_generados.append(item)
+                err_count += 1
+            except requests.exceptions.Timeout:
+                items_generados.append(item)
+                err_count += 1
+            except Exception:
+                items_generados.append(item)
+                err_count += 1
+
+        progress.progress(1.0, text="✅ Completado")
+        st.session_state.items_ia = items_generados
+
+        if ok_count > 0:
+            st.success(f"✅ IA generó componentes para **{ok_count}** ítems.")
+        if err_count > 0:
+            st.warning(
+                f"⚠️ **{err_count} ítems** no pudieron generarse automáticamente. "
+                "Puede ingresarlos manualmente en la sección siguiente o generar el Excel "
+                "con las celdas vacías para completarlas después."
+            )
+
+    # Resultado IA generado
+    if 'items_ia' in st.session_state and st.session_state.items_ia:
+        con_comp = [i for i in st.session_state.items_ia if sum(len(i.get(s,[])) for s in ('materiales','herramientas','mano_de_obra')) > 0]
+        sin_comp = [i for i in st.session_state.items_ia if sum(len(i.get(s,[])) for s in ('materiales','herramientas','mano_de_obra')) == 0]
+        mo_baja  = [i for i in con_comp if i.get('alerta_mo', False)]
+
+        if mo_baja:
+            st.warning(
+                f"⚠️ **{len(mo_baja)} ítem(s) tienen mano de obra inferior al 5% del costo directo.** "
+                "Revíselos en la hoja RESUMEN (celdas naranjas) y ajuste la tabla 2 antes de entregar."
+            )
+
+        with st.expander(f"🤖 Componentes generados por IA: {len(con_comp)} ítems completos, {len(sin_comp)} vacíos", expanded=False):
+            for item in con_comp[:10]:
+                n = sum(len(item.get(s,[])) for s in ('materiales','herramientas','mano_de_obra'))
+                precio = item['valor_ofrecido']
+                suma = sum(c['rend']*c['unit_price'] for s in ('materiales','herramientas','mano_de_obra','transporte') for c in item.get(s,[]))
+                cierra = "✅" if abs(precio-suma) < 2 else f"⚠️ diff=${abs(precio-suma):,.0f}"
+                mo_tag = f" | ⚠️ MO {item['pct_mo']}%" if item.get('alerta_mo') else ""
+                st.markdown(f"**`{item['code']}`** — {item['description'][:55]} | ${precio:,.0f} | {n} comp | {cierra}{mo_tag}")
+
+# ── Generación final ──────────────────────────────────────────────────────────
+seccion_num = "6." if sin_apu else "5."
+st.subheader(f"{seccion_num} Generar y descargar APUs")
+
+items_manuales_final = st.session_state.get('items_ia', [])
+items_sin_procesar = [
+    i for i in sin_apu
+    if i['code'] not in {x['code'] for x in items_manuales_final}
+]
+todos_manuales = items_manuales_final + items_sin_procesar
+n_gen = len(con_apu) + len(todos_manuales)
+aiu_txt = f"con AIU ({aiu_pct*100:.1f}%)" if include_aiu else "sin AIU"
 
 if n_gen == 0:
     st.warning("No hay ítems para generar.")
 else:
-    st.markdown(f"""
-    El Excel resultante tendrá:
-    - **{len(con_apu)} hojas en verde** — APUs ajustados, rendimiento MO calibrado al precio ofrecido
-    - **{len(sin_apu)} hojas en rojo** — ítems sin APU para completar manualmente
-    - **1 hoja RESUMEN** — tabla general de todos los ítems
-    """)
+    if items_sin_procesar:
+        st.info(
+            f"ℹ️ {len(items_sin_procesar)} ítem(s) se generarán con estructura vacía "
+            "(sin componentes). Puede completarlos manualmente en el Excel descargado."
+        )
 
-    if st.button(f"🚀 Generar {n_gen} APU(s) en Excel", type="primary", use_container_width=True):
+    if st.button(f"🚀 Generar {n_gen} APU(s) — {aiu_txt}",
+                 type="primary", use_container_width=True):
         with st.spinner(f"Generando {n_gen} APUs..."):
             try:
-                excel_bytes = generate_apu_excel(
-                    items_ajustados=con_apu,
-                    items_sin_apu=sin_apu,
+                excel = generate_apu_excel(
+                    resultado,
+                    items_manuales=todos_manuales if todos_manuales else None,
+                    include_aiu=include_aiu,
+                    aiu_pct=aiu_pct,
                     bd_externas=bds_externas if bds_externas else None,
                 )
-                st.session_state['excel_bytes']    = excel_bytes
-                st.session_state['nombre_archivo'] = (
-                    uploaded_propuesta.name.replace('.xlsx','').replace('.xlsm','')
-                )
+                st.session_state.excel = excel
+                st.session_state.nombre = uploaded_proceso.name.replace('.xlsx','').replace('.xlsm','')
                 st.success(
-                    f"✅ **{len(con_apu)} APUs generados** — cierra exactamente con su oferta.  \n"
-                    f"🔴 **{len(sin_apu)} ítems en rojo** — completar manualmente."
+                    f"✅ **{n_gen} APUs generados.** "
+                    f"El PRECIO UNITARIO de cada APU cuadra exactamente con su oferta."
                 )
             except Exception as e:
                 st.error(f"❌ Error al generar: {e}")
-                st.code(traceback.format_exc(), language="text")
+                raise e
 
-    if 'excel_bytes' in st.session_state:
-        nombre_dl = f"APUs_{st.session_state['nombre_archivo']}.xlsx"
+    if "excel" in st.session_state:
         st.download_button(
             label="⬇️ Descargar APUs en Excel",
-            data=st.session_state['excel_bytes'],
-            file_name=nombre_dl,
+            data=st.session_state.excel,
+            file_name=f"APUs_{st.session_state.nombre}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-            type="primary",
+            use_container_width=True, type="primary",
         )
