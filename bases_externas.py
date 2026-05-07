@@ -1,8 +1,15 @@
 """
 bases_externas.py — Motor de búsqueda en bases de precios externas.
-Soporta: Gobernación de Boyacá, INVIAS (y cualquier base con estructura similar).
+GLI Colombia S.A.S. · v12.0 · 2026
+
+Fuentes soportadas (en orden de cascada):
+  1. APU de la entidad contratante (Camino A — generator.py)
+  2. Catálogo Policía Nacional 1LF-FR-0206 (zonas A1-A6)
+  3. APU INVIAS regionalizados (Excel descargado por provincia)
+  4. Cualquier base externa genérica (gobernación, IDU, etc.)
 """
 import unicodedata, re
+import pandas as pd
 from openpyxl import load_workbook
 
 
@@ -19,7 +26,7 @@ def _norm(texto):
 _STOPWORDS = {
     'DE','LA','EL','EN','CON','Y','A','E','O','UN','UNA','LOS','LAS',
     'DEL','AL','POR','SU','ES','SE','QUE','PARA','HASTA','DESDE','SIN',
-    'NO','SI','NI','MAS','MAS','TIPO','SEGUN','INCLUYE','INCLUYE',
+    'NO','SI','NI','MAS','TIPO','SEGUN','INCLUYE',
 }
 
 
@@ -28,24 +35,19 @@ _STOPWORDS = {
 # ══════════════════════════════════════════════════════════════════
 
 def _detectar_formato(ws):
-    """
-    Detecta el formato de la base de precios.
-    Retorna 'boyaca' | 'invias' | 'generico' | None
-    """
     primera = list(ws.iter_rows(min_row=1, max_row=1, values_only=True))[0]
     cols = [str(v).upper().strip() if v else '' for v in primera]
     cols_str = ' '.join(cols)
 
-    # Formato Gobernación de Boyacá
-    if ('CODIGO ITEM' in cols_str and 'UNIDAD' in cols_str and 'TOTAL' in cols_str
-            and 'CAPITULO' in cols_str):
+    if ('CODIGO ITEM' in cols_str and 'UNIDAD' in cols_str
+            and 'TOTAL' in cols_str and 'CAPITULO' in cols_str):
         return 'boyaca'
 
-    # Formato INVIAS (a implementar cuando se cargue)
-    if 'INVIAS' in cols_str or ('CODIGO' in cols_str and 'PRECIO' in cols_str):
+    # INVIAS: columnas ITEM, DESCRIPCION_ACTIVIDAD, UNIDAD, COSTO_DIRECTO
+    if ('DESCRIPCION_ACTIVIDAD' in cols_str or
+            ('ITEM' in cols_str and 'COSTO_DIRECTO' in cols_str)):
         return 'invias'
 
-    # Formato genérico: código, descripción, unidad, precio
     if any(x in cols_str for x in ('CODIGO', 'ITEM', 'DESCRIPCION')) and \
        any(x in cols_str for x in ('PRECIO', 'VALOR', 'TOTAL', 'UNITARIO')):
         return 'generico'
@@ -58,12 +60,6 @@ def _detectar_formato(ws):
 # ══════════════════════════════════════════════════════════════════
 
 def _cargar_boyaca(ws):
-    """
-    Estructura Gobernación de Boyacá:
-    col0=cod_cap, col1=capitulo, col2=cod_sub, col3=subcapitulo,
-    col4=codigo_item, col5=descripcion, col6=unidad,
-    col7=vr_mano_obra, col8=total
-    """
     bd = {}
     for row in ws.iter_rows(min_row=2, values_only=True):
         if not row[4] or not row[8]: continue
@@ -73,39 +69,120 @@ def _cargar_boyaca(ws):
         codigo = str(row[4]).strip()
         desc   = str(row[5]).strip() if row[5] else ''
         bd[codigo] = {
-            'codigo':      codigo,
-            'fuente':      'Gobernación de Boyacá',
-            'capitulo':    str(row[1]).strip() if row[1] else '',
+            'codigo': codigo, 'fuente': 'Gobernación de Boyacá',
+            'capitulo': str(row[1]).strip() if row[1] else '',
             'subcapitulo': str(row[3]).strip() if row[3] else '',
-            'descripcion': desc,
-            'unidad':      str(row[6]).strip() if row[6] else '',
-            'vr_mo':       mo,
-            'vr_mat_equip': total - mo,
-            'total':       total,
-            'desc_norm':   _norm(desc),
+            'descripcion': desc, 'unidad': str(row[6]).strip() if row[6] else '',
+            'vr_mo': mo, 'vr_mat_equip': total - mo,
+            'total': total, 'desc_norm': _norm(desc),
         }
     return bd
 
 
-def _cargar_generico(ws):
+def _cargar_invias(ws):
     """
-    Intenta cargar cualquier base con encabezados detectados automáticamente.
+    Carga APUs INVIAS desde Excel descargado de hermes.invias.gov.co
+    Columnas esperadas: ITEM, DESCRIPCION_ACTIVIDAD, UNIDAD,
+    SUBTOTAL_MATERIALES, SUBTOTAL_EQUIPOS, SUBTOTAL_MANO_OBRA,
+    SUBTOTAL_TRANSPORTE, COSTO_DIRECTO, NOMBRE_PROVINCIA
     """
     primera = list(ws.iter_rows(min_row=1, max_row=1, values_only=True))[0]
     cols = [str(v).upper().strip() if v else '' for v in primera]
 
-    # Detectar columnas
-    col_cod  = next((j for j, c in enumerate(cols) if 'CODIGO' in c or c == 'ITEM'), None)
-    col_desc = next((j for j, c in enumerate(cols) if 'DESCRIPCION' in c or 'DESCRIPCI' in c), None)
-    col_und  = next((j for j, c in enumerate(cols) if c in ('UNIDAD','UND','UN','UND.')), None)
-    col_tot  = next((j for j, c in enumerate(cols)
-                     if any(x in c for x in ('TOTAL','PRECIO UNIT','VALOR UNIT'))), None)
+    def _ci(nombre):  # column index
+        for j, c in enumerate(cols):
+            if nombre in c:
+                return j
+        return None
+
+    col_item = _ci('ITEM')
+    col_desc = _ci('DESCRIPCION_ACTIVIDAD') or _ci('DESCRIPCION')
+    col_und  = _ci('UNIDAD')
+    col_mat  = _ci('SUBTOTAL_MATERIALES') or _ci('MATERIALES')
+    col_mo   = _ci('SUBTOTAL_MANO_OBRA') or _ci('MANO_OBRA') or _ci('MANO DE OBRA')
+    col_eq   = _ci('SUBTOTAL_EQUIPOS') or _ci('EQUIPOS')
+    col_tra  = _ci('SUBTOTAL_TRANSPORTE') or _ci('TRANSPORTE')
+    col_tot  = _ci('COSTO_DIRECTO') or _ci('COSTO DIRECTO') or _ci('TOTAL')
+    col_prov = _ci('NOMBRE_PROVINCIA') or _ci('PROVINCIA')
 
     if col_desc is None or col_tot is None:
         return {}
 
     bd = {}
     for row in ws.iter_rows(min_row=2, values_only=True):
+        row = list(row)
+        total = row[col_tot] if col_tot < len(row) else None
+        if not isinstance(total, (int, float)) or total <= 0:
+            continue
+        desc = str(row[col_desc]).strip() if col_desc < len(row) and row[col_desc] else ''
+        if not desc:
+            continue
+        codigo = str(row[col_item]).strip() if col_item is not None and col_item < len(row) and row[col_item] else f'INV-{len(bd)+1}'
+        und    = str(row[col_und]).strip() if col_und is not None and col_und < len(row) and row[col_und] else ''
+        prov   = str(row[col_prov]).strip() if col_prov is not None and col_prov < len(row) and row[col_prov] else ''
+        mat    = float(row[col_mat]) if col_mat is not None and col_mat < len(row) and isinstance(row[col_mat], (int,float)) else 0
+        mo     = float(row[col_mo])  if col_mo  is not None and col_mo  < len(row) and isinstance(row[col_mo],  (int,float)) else 0
+        eq     = float(row[col_eq])  if col_eq  is not None and col_eq  < len(row) and isinstance(row[col_eq],  (int,float)) else 0
+        tra    = float(row[col_tra]) if col_tra  is not None and col_tra < len(row) and isinstance(row[col_tra], (int,float)) else 0
+
+        bd[codigo] = {
+            'codigo': codigo, 'fuente': f'INVIAS 2025-2{" · " + prov if prov else ""}',
+            'descripcion': desc, 'unidad': und,
+            'vr_mo': mo, 'vr_mat_equip': mat + eq,
+            'subtotal_mat': mat, 'subtotal_mo': mo,
+            'subtotal_eq': eq, 'subtotal_tra': tra,
+            'total': float(total), 'desc_norm': _norm(desc),
+            'provincia': prov,
+            # Componentes desagregados para APU completo
+            'componentes': _componentes_desde_subtotales(mat, mo, eq, tra, prov),
+        }
+    return bd
+
+
+def _componentes_desde_subtotales(mat, mo, eq, tra, provincia=''):
+    """Construye secciones mínimas desde subtotales INVIAS."""
+    fuente = f'INVIAS 2025-2{" · " + provincia if provincia else ""}'
+    secciones = {'materiales': [], 'herramientas': [], 'transporte': [], 'mano_de_obra': []}
+    if mat > 0:
+        secciones['materiales'].append({
+            'description': 'Materiales (INVIAS referencia)',
+            'unit': 'Glb', 'rend': 1.0, 'unit_price': mat,
+            'parcial': mat, '_rend_ajustado': False, '_fuente': fuente,
+        })
+    if mo > 0:
+        secciones['mano_de_obra'].append({
+            'description': 'Mano de obra (INVIAS referencia)',
+            'unit': 'Glb', 'rend': 1.0, 'unit_price': mo,
+            'parcial': mo, '_rend_ajustado': False, '_fuente': fuente,
+        })
+    if eq > 0:
+        secciones['herramientas'].append({
+            'description': 'Equipos (INVIAS referencia)',
+            'unit': 'Glb', 'rend': 1.0, 'unit_price': eq,
+            'parcial': eq, '_rend_ajustado': False, '_fuente': fuente,
+        })
+    if tra > 0:
+        secciones['transporte'].append({
+            'description': 'Transporte (INVIAS referencia)',
+            'unit': 'Glb', 'rend': 1.0, 'unit_price': tra,
+            'parcial': tra, '_rend_ajustado': False, '_fuente': fuente,
+        })
+    return secciones
+
+
+def _cargar_generico(ws):
+    primera = list(ws.iter_rows(min_row=1, max_row=1, values_only=True))[0]
+    cols = [str(v).upper().strip() if v else '' for v in primera]
+    col_cod  = next((j for j, c in enumerate(cols) if 'CODIGO' in c or c == 'ITEM'), None)
+    col_desc = next((j for j, c in enumerate(cols) if 'DESCRIPCION' in c or 'DESCRIPCI' in c), None)
+    col_und  = next((j for j, c in enumerate(cols) if c in ('UNIDAD','UND','UN','UND.')), None)
+    col_tot  = next((j for j, c in enumerate(cols)
+                     if any(x in c for x in ('TOTAL','PRECIO UNIT','VALOR UNIT'))), None)
+    if col_desc is None or col_tot is None:
+        return {}
+    bd = {}
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        row = list(row)
         total = row[col_tot] if col_tot < len(row) else None
         if not isinstance(total, (int, float)) or total <= 0: continue
         desc = str(row[col_desc]).strip() if col_desc < len(row) and row[col_desc] else ''
@@ -114,29 +191,23 @@ def _cargar_generico(ws):
         und = str(row[col_und]).strip() if col_und is not None and col_und < len(row) and row[col_und] else ''
         bd[codigo] = {
             'codigo': codigo, 'fuente': 'Base externa',
-            'capitulo': '', 'subcapitulo': '', 'descripcion': desc,
-            'unidad': und, 'vr_mo': 0, 'vr_mat_equip': float(total),
+            'descripcion': desc, 'unidad': und,
+            'vr_mo': 0, 'vr_mat_equip': float(total),
             'total': float(total), 'desc_norm': _norm(desc),
         }
     return bd
 
 
 # ══════════════════════════════════════════════════════════════════
-# FUNCIÓN PRINCIPAL DE CARGA
+# FUNCIÓN PRINCIPAL DE CARGA — fuente genérica / INVIAS / Gobernación
 # ══════════════════════════════════════════════════════════════════
 
 def cargar_base_externa(archivo, nombre_fuente=None):
-    """
-    Carga un archivo de base de precios externa.
-    Retorna (bd_dict, formato_detectado, error).
-    bd_dict: {codigo → ítem}
-    """
     try:
         wb = load_workbook(archivo, data_only=True)
     except Exception as e:
         return {}, None, f"No se pudo abrir el archivo: {e}"
 
-    # Intentar cada hoja hasta encontrar una con datos
     for nombre in wb.sheetnames:
         ws = wb[nombre]
         if ws.max_row < 5:
@@ -145,12 +216,16 @@ def cargar_base_externa(archivo, nombre_fuente=None):
         if fmt == 'boyaca':
             bd = _cargar_boyaca(ws)
             fuente = nombre_fuente or 'Gobernación de Boyacá'
-            for v in bd.values():
-                v['fuente'] = fuente
-            return bd, 'boyaca', None
-        elif fmt in ('invias', 'generico'):
+        elif fmt == 'invias':
+            bd = _cargar_invias(ws)
+            fuente = nombre_fuente or 'INVIAS 2025-2'
+        elif fmt == 'generico':
             bd = _cargar_generico(ws)
             fuente = nombre_fuente or 'Base externa'
+        else:
+            continue
+
+        if bd:
             for v in bd.values():
                 v['fuente'] = fuente
             return bd, fmt, None
@@ -163,17 +238,11 @@ def cargar_base_externa(archivo, nombre_fuente=None):
 # ══════════════════════════════════════════════════════════════════
 
 def buscar_en_base(descripcion, unidad, bd, top_n=5, umbral_pct=30):
-    """
-    Busca los ítems más similares en una base de precios externa.
-    Retorna lista de (score, pct_coincidencia, item) ordenada por score desc.
-    """
     palabras = {p for p in _norm(descripcion).split()
                 if len(p) >= 4 and p not in _STOPWORDS}
     if not palabras:
         return []
-
     und_norm = _norm(unidad) if unidad else ''
-
     resultados = []
     for item in bd.values():
         palabras_item = set(item['desc_norm'].split())
@@ -184,160 +253,110 @@ def buscar_en_base(descripcion, unidad, bd, top_n=5, umbral_pct=30):
         if pct < umbral_pct:
             continue
         bonus = 0.5 if und_norm and und_norm == _norm(item['unidad']) else 0
-        score = coincidencias + bonus
-        resultados.append((score, pct, item))
-
+        resultados.append((coincidencias + bonus, pct, item))
     resultados.sort(key=lambda x: -x[0])
     return resultados[:top_n]
 
 
 def construir_apu_desde_base(item_bd, valor_ofrecido):
     """
-    Construye un APU simplificado a partir de un ítem de base de precios.
-    Escala los componentes al valor ofrecido.
-    Retorna dict compatible con el generator.
+    Construye APU compatible con el generador desde un ítem de base externa.
+    Usa componentes desagregados si existen (INVIAS), o subtotales si no.
     """
     total_ref = item_bd['total']
-    factor = valor_ofrecido / total_ref if total_ref > 0 else 1.0
 
-    mo_ref       = item_bd['vr_mo']
-    mat_eq_ref   = item_bd['vr_mat_equip']
-
-    mo_escalado     = round(mo_ref * factor, 2)
-    mat_eq_escalado = round(mat_eq_ref * factor, 2)
-
-    # Ajuste para que cierre exacto
-    diferencia = valor_ofrecido - mo_escalado - mat_eq_escalado
-    if abs(diferencia) > 0:
-        if mo_escalado > 0:
-            mo_escalado = round(mo_escalado + diferencia, 2)
+    # Si tiene componentes desagregados (formato INVIAS con subtotales)
+    if 'componentes' in item_bd:
+        secciones = item_bd['componentes']
+        # Clonar para no mutar el original
+        import copy
+        secciones = copy.deepcopy(secciones)
+    else:
+        # Formato simple: dos líneas (MO + materiales/equipos)
+        factor = valor_ofrecido / total_ref if total_ref > 0 else 1.0
+        mo_ref = item_bd.get('vr_mo', 0)
+        mat_eq_ref = item_bd.get('vr_mat_equip', total_ref)
+        mo_esc = round(mo_ref * factor, 2)
+        mat_esc = round(mat_eq_ref * factor, 2)
+        diff = valor_ofrecido - mo_esc - mat_esc
+        if mo_esc > 0:
+            mo_esc = round(mo_esc + diff, 2)
         else:
-            mat_eq_escalado = round(mat_eq_escalado + diferencia, 2)
-
-    componentes_mdo = []
-    if mo_escalado > 0:
-        componentes_mdo = [{
-            'description': 'Mano de obra (cuadrilla)',
-            'unit': 'HR',
-            'rend': 1.0,
-            'unit_price': mo_escalado,
-            'parcial': mo_escalado,
-        }]
-
-    componentes_mat = []
-    if mat_eq_escalado > 0:
-        componentes_mat = [{
-            'description': 'Materiales, insumos y equipos',
-            'unit': 'GL',
-            'rend': 1.0,
-            'unit_price': mat_eq_escalado,
-            'parcial': mat_eq_escalado,
-        }]
+            mat_esc = round(mat_esc + diff, 2)
+        secciones = {
+            'materiales':   [{'description': 'Materiales, insumos y equipos', 'unit': 'GL',
+                               'rend': 1.0, 'unit_price': mat_esc, 'parcial': mat_esc,
+                               '_rend_ajustado': False}] if mat_esc > 0 else [],
+            'herramientas': [],
+            'transporte':   [],
+            'mano_de_obra': [{'description': 'Mano de obra (cuadrilla)', 'unit': 'HR',
+                               'rend': 1.0, 'unit_price': mo_esc, 'parcial': mo_esc,
+                               '_rend_ajustado': False}] if mo_esc > 0 else [],
+        }
 
     return {
-        'materiales':   componentes_mat,
-        'herramientas': [],
-        'transporte':   [],
-        'mano_de_obra': componentes_mdo,
-        'fuente_bd':    item_bd['fuente'],
-        'codigo_bd':    item_bd['codigo'],
+        **secciones,
+        'fuente_bd':        item_bd['fuente'],
+        'codigo_bd':        item_bd['codigo'],
         'total_referencia': total_ref,
     }
 
 
 # ══════════════════════════════════════════════════════════════════
-# CATÁLOGO POLICÍA NACIONAL 2026 — Cargador dedicado
+# CATÁLOGO POLICÍA NACIONAL 2026
 # Fuente: 10. PRESUPUESTO APU ESPECIFICACIONES TECNICAS PARTICULARES.xlsx
-# Código oficial: 1LF-FR-0206 · Vigencia 2026
+# Código: 1LF-FR-0206 · Vigencia 2026
 # ══════════════════════════════════════════════════════════════════
 
-import pandas as pd
-
-def _zona_col(zona: str) -> str:
-    """Mapea zona A1..A6 al nombre de columna en las hojas del catálogo."""
-    return {
-        "A1": "A1", "A2": "A2", "A3": "A3",
-        "A4": "A4", "A5": "A5", "A6": "A6",
-    }.get(zona.upper(), "A1")
-
-
 def cargar_catalogo_policia(ruta_archivo, zona: str = "A1"):
-    """
-    Carga el catálogo Policía Nacional 2026 y retorna cuatro diccionarios:
-      actividades : {codigo → {descripcion, unidad, precio}}
-      insumos     : {descripcion_norm → {descripcion, unidad, precio}}
-      equipos     : {descripcion_norm → {descripcion, unidad, precio_hora}}
-      mano_obra   : {descripcion_norm → {descripcion, unidad, precio_hora}}
-
-    zona: 'A1'..'A6' — selecciona la columna de precio correspondiente.
-    """
     try:
         xls = pd.ExcelFile(ruta_archivo)
     except Exception as e:
         return {}, {}, {}, {}, f"No se pudo abrir el catálogo Policía: {e}"
 
     zona = zona.upper()
-    col_precio_act  = f"VR. UNIT."    # LISTADO ACTIVIDADES usa nombres A1..A6 en fila 0
-    col_precio_insumo = "Vigencia 2026"
-    col_precio_equipo = f"COSTO  {zona}"  # EQUIPOS: "COSTO  A1", "COSTO  A2", etc.
+    zona_idx = {"A1": 4, "A2": 5, "A3": 6, "A4": 7, "A5": 8, "A6": 9}
+    col_z = zona_idx.get(zona, 4)
 
-    # ── ACTIVIDADES PRE-TARIFADAS ─────────────────────────────────────────────
     actividades = {}
     try:
         df_act = pd.read_excel(ruta_archivo, sheet_name="LISTADO ACTIVIDADES", header=None)
-        # Fila 0: encabezados. Columnas: 0=CAP, 1=Código, 2=ACTIVIDAD, 3=UN, 4=A1..9=A6
-        # Detectar columna de zona (A1=col4, A2=col5 ... A6=col9)
-        zona_idx = {"A1": 4, "A2": 5, "A3": 6, "A4": 7, "A5": 8, "A6": 9}
-        col_z = zona_idx.get(zona, 4)
         for _, row in df_act.iterrows():
-            cod = str(row.iloc[1]).strip() if pd.notna(row.iloc[1]) else ""
-            desc = str(row.iloc[2]).strip() if pd.notna(row.iloc[2]) else ""
-            und = str(row.iloc[3]).strip() if pd.notna(row.iloc[3]) else ""
+            cod   = str(row.iloc[1]).strip() if pd.notna(row.iloc[1]) else ""
+            desc  = str(row.iloc[2]).strip() if pd.notna(row.iloc[2]) else ""
+            und   = str(row.iloc[3]).strip() if pd.notna(row.iloc[3]) else ""
             precio = row.iloc[col_z] if col_z < len(row) else None
             if not cod or not desc or cod in ("NaN", "nan", "CAP.", "ACTIVIDAD"):
                 continue
             if not isinstance(precio, (int, float)) or precio <= 0:
                 continue
             actividades[cod] = {
-                "codigo":      cod,
-                "descripcion": desc,
-                "unidad":      und,
-                "precio":      float(precio),
-                "zona":        zona,
-                "fuente":      "Catálogo Policía 1LF-FR-0206 · 2026",
-            }
-    except Exception as e:
-        pass   # hoja no encontrada — continuar con las demás
-
-    # ── INSUMOS (precio único nacional) ──────────────────────────────────────
-    insumos = {}
-    try:
-        df_ins = pd.read_excel(ruta_archivo, sheet_name="INSUMOS", header=0)
-        # Columnas: Descripción, UND, Vigencia 2026
-        for _, row in df_ins.iterrows():
-            desc = str(row.iloc[0]).strip() if pd.notna(row.iloc[0]) else ""
-            und  = str(row.iloc[1]).strip() if pd.notna(row.iloc[1]) else ""
-            precio = row.iloc[2] if len(row) > 2 else None
-            if not desc or desc in ("Descripción",):
-                continue
-            if not isinstance(precio, (int, float)) or precio <= 0:
-                continue
-            key = _norm(desc)
-            insumos[key] = {
-                "descripcion": desc,
-                "unidad":      und,
-                "precio":      float(precio),
-                "fuente":      "Catálogo Policía 1LF-FR-0206 · 2026 · Insumos",
+                "codigo": cod, "descripcion": desc, "unidad": und,
+                "precio": float(precio), "zona": zona,
+                "fuente": "Catálogo Policía 1LF-FR-0206 · 2026",
             }
     except Exception:
         pass
 
-    # ── EQUIPOS (precio por zona) ─────────────────────────────────────────────
+    insumos = {}
+    try:
+        df_ins = pd.read_excel(ruta_archivo, sheet_name="INSUMOS", header=0)
+        for _, row in df_ins.iterrows():
+            desc  = str(row.iloc[0]).strip() if pd.notna(row.iloc[0]) else ""
+            und   = str(row.iloc[1]).strip() if pd.notna(row.iloc[1]) else ""
+            precio = row.iloc[2] if len(row) > 2 else None
+            if not desc or desc in ("Descripción",): continue
+            if not isinstance(precio, (int, float)) or precio <= 0: continue
+            insumos[_norm(desc)] = {
+                "descripcion": desc, "unidad": und, "precio": float(precio),
+                "fuente": "Catálogo Policía 1LF-FR-0206 · 2026 · Insumos",
+            }
+    except Exception:
+        pass
+
     equipos = {}
     try:
         df_eq = pd.read_excel(ruta_archivo, sheet_name="EQUIPOS", header=None)
-        # Fila 0: PRECIOS ALQUILER... Fila 1: DESCRIPCIÓN, UND, COSTO A1..COSTO A6
-        # Detectar columna de zona desde fila 1
         header_row = list(df_eq.iloc[1])
         col_zona_eq = None
         for j, h in enumerate(header_row):
@@ -347,58 +366,35 @@ def cargar_catalogo_policia(ruta_archivo, zona: str = "A1"):
         if col_zona_eq is None:
             col_zona_eq = {"A1":2,"A2":3,"A3":4,"A4":5,"A5":6,"A6":7}.get(zona, 2)
         for _, row in df_eq.iloc[2:].iterrows():
-            desc = str(row.iloc[0]).strip() if pd.notna(row.iloc[0]) else ""
-            und  = str(row.iloc[1]).strip() if pd.notna(row.iloc[1]) else ""
+            desc  = str(row.iloc[0]).strip() if pd.notna(row.iloc[0]) else ""
+            und   = str(row.iloc[1]).strip() if pd.notna(row.iloc[1]) else ""
             precio = row.iloc[col_zona_eq] if col_zona_eq < len(row) else None
-            if not desc or not isinstance(precio, (int, float)) or precio <= 0:
-                continue
-            key = _norm(desc)
-            equipos[key] = {
-                "descripcion": desc,
-                "unidad":      und,
-                "precio_hora": float(precio),
-                "zona":        zona,
-                "fuente":      "Catálogo Policía 1LF-FR-0206 · 2026 · Equipos",
+            if not desc or not isinstance(precio, (int, float)) or precio <= 0: continue
+            equipos[_norm(desc)] = {
+                "descripcion": desc, "unidad": und, "precio_hora": float(precio),
+                "zona": zona, "fuente": "Catálogo Policía 1LF-FR-0206 · 2026 · Equipos",
             }
     except Exception:
         pass
 
-    # ── MANO DE OBRA (precio por zona) ───────────────────────────────────────
     mano_obra = {}
     try:
         df_mo = pd.read_excel(ruta_archivo, sheet_name="MANO DE OBRA", header=None)
-        # Estructura variable — buscar filas con valor numérico > 0 en la columna de zona
-        # Fila 11: encabezado con DESCRIPCIÓN, UNIDAD, VALOR UNITARIO, etc.
-        # Las tarifas individuales y cuadrillas están en col2 (valor sin FP)
-        # Para zona A1 usar col2; para otras zonas buscar col correspondiente
-        # Simplificación robusta: leer todo y filtrar filas numéricas con descripción
+        from salarios import MULTIPLICADORES_ZONA
         for _, row in df_mo.iterrows():
             desc = str(row.iloc[0]).strip() if pd.notna(row.iloc[0]) else ""
             und  = str(row.iloc[1]).strip() if pd.notna(row.iloc[1]) else ""
-            # La tarifa sin factor prestacional está en col 2
-            # Usar col 2 para A1; para otras zonas multiplicar por el factor de zona
-            from salarios import MULTIPLICADORES_ZONA
             tarifa_base = row.iloc[2] if len(row) > 2 else None
-            if not desc or len(desc) < 5:
-                continue
-            if not isinstance(tarifa_base, (int, float)) or tarifa_base <= 0:
-                continue
-            # Filtrar encabezados y filas no-tarifa
-            if any(x in desc.upper() for x in ("DESCRIPCI", "SALARIO", "CLASIFIC",
-                                                 "PERSONAL", "CUADRILLA", "ESTRUCTURA")):
-                # "CUADRILLA" puede ser encabezado de sección — ignorar si no tiene número
-                if not isinstance(tarifa_base, float) or tarifa_base > 50_000_000:
-                    continue
+            if not desc or len(desc) < 5: continue
+            if not isinstance(tarifa_base, (int, float)) or tarifa_base <= 0: continue
+            if any(x in desc.upper() for x in ("DESCRIPCI","SALARIO","CLASIFIC","PERSONAL","ESTRUCTURA")):
+                if tarifa_base > 50_000_000: continue
             mult = MULTIPLICADORES_ZONA.get(zona, 1.0)
-            precio_zona = round(float(tarifa_base) * mult, 6)
-            key = _norm(desc)
-            mano_obra[key] = {
-                "descripcion":  desc,
-                "unidad":       und if und else "mes",
-                "precio_hora":  precio_zona,
-                "precio_base":  float(tarifa_base),
-                "zona":         zona,
-                "fuente":       "Catálogo Policía 1LF-FR-0206 · 2026 · Mano de Obra",
+            mano_obra[_norm(desc)] = {
+                "descripcion": desc, "unidad": und if und else "mes",
+                "precio_hora": round(float(tarifa_base) * mult, 6),
+                "precio_base": float(tarifa_base), "zona": zona,
+                "fuente": "Catálogo Policía 1LF-FR-0206 · 2026 · Mano de Obra",
             }
     except Exception:
         pass
@@ -406,13 +402,7 @@ def cargar_catalogo_policia(ruta_archivo, zona: str = "A1"):
     return actividades, insumos, equipos, mano_obra, None
 
 
-def buscar_actividad_policia(descripcion: str, unidad: str,
-                              actividades: dict, top_n: int = 5,
-                              umbral_pct: int = 25) -> list:
-    """
-    Busca actividades del catálogo Policía por similitud de descripción.
-    Retorna lista de (score, pct, item) ordenada por relevancia.
-    """
+def buscar_actividad_policia(descripcion, unidad, actividades, top_n=5, umbral_pct=25):
     palabras = {p for p in _norm(descripcion).split()
                 if len(p) >= 4 and p not in _STOPWORDS}
     if not palabras:
@@ -422,32 +412,98 @@ def buscar_actividad_policia(descripcion: str, unidad: str,
     for item in actividades.values():
         palabras_item = set(_norm(item["descripcion"]).split())
         coincidencias = len(palabras & palabras_item)
-        if coincidencias == 0:
-            continue
+        if coincidencias == 0: continue
         pct = coincidencias / len(palabras) * 100
-        if pct < umbral_pct:
-            continue
+        if pct < umbral_pct: continue
         bonus = 0.5 if und_norm and und_norm == _norm(item["unidad"]) else 0
         resultados.append((coincidencias + bonus, pct, item))
     resultados.sort(key=lambda x: -x[0])
     return resultados[:top_n]
 
 
-def precio_insumo_policia(descripcion: str, insumos: dict) -> dict | None:
+# ══════════════════════════════════════════════════════════════════
+# CASCADA DE FUENTES — función central del Camino B
+# ══════════════════════════════════════════════════════════════════
+
+def buscar_en_cascada(descripcion, unidad, valor_ofrecido, fuentes: list[dict]) -> dict | None:
     """
-    Busca el precio de un insumo en el catálogo Policía por nombre exacto o similar.
-    Retorna el ítem más cercano o None si no hay coincidencia con score > 50%.
+    Busca la actividad en múltiples fuentes en orden de prioridad.
+    fuentes: lista de dicts con keys:
+      - tipo: 'policia' | 'invias' | 'generica'
+      - nombre: nombre para mostrar
+      - bd o actividades: el diccionario de datos cargado
+    Retorna dict compatible con el generador o None si no encontró nada.
     """
-    palabras = {p for p in _norm(descripcion).split()
-                if len(p) >= 4 and p not in _STOPWORDS}
-    if not palabras:
-        return None
-    mejor = None
-    mejor_score = 0
-    for key, item in insumos.items():
-        palabras_item = set(key.split())
-        score = len(palabras & palabras_item) / len(palabras)
-        if score > mejor_score:
-            mejor_score = score
-            mejor = item
-    return mejor if mejor_score >= 0.5 else None
+    for fuente in fuentes:
+        tipo   = fuente.get('tipo', 'generica')
+        nombre = fuente.get('nombre', 'Fuente externa')
+
+        if tipo == 'policia':
+            actividades = fuente.get('actividades', {})
+            if not actividades:
+                continue
+            resultados = buscar_actividad_policia(descripcion, unidad, actividades, top_n=1)
+            if not resultados:
+                continue
+            _, pct, item = resultados[0]
+            # Construir APU desde actividad Policía (precio total, sin desagregar)
+            precio_ref = item['precio']
+            factor = valor_ofrecido / precio_ref if precio_ref > 0 else 1.0
+            return {
+                'fuente_bd':        f"{nombre} · {pct:.0f}% similitud",
+                'codigo_bd':        item['codigo'],
+                'total_referencia': precio_ref,
+                'materiales':       [{'description': 'Materiales e insumos (Policía ref.)',
+                                      'unit': 'Glb', 'rend': 1.0,
+                                      'unit_price': round(precio_ref * factor * 0.60, 0),
+                                      'parcial':    round(precio_ref * factor * 0.60, 0),
+                                      '_rend_ajustado': False}],
+                'herramientas':     [],
+                'transporte':       [],
+                'mano_de_obra':     [{'description': 'Mano de obra (Policía ref.)',
+                                      'unit': 'Glb', 'rend': 1.0,
+                                      'unit_price': round(precio_ref * factor * 0.40, 0),
+                                      'parcial':    round(precio_ref * factor * 0.40, 0),
+                                      '_rend_ajustado': False}],
+            }
+
+        else:  # 'invias' o 'generica'
+            bd = fuente.get('bd', {})
+            if not bd:
+                continue
+            resultados = buscar_en_base(descripcion, unidad, bd, top_n=1)
+            if not resultados:
+                continue
+            _, pct, item_bd = resultados[0]
+            item_bd = dict(item_bd)
+            item_bd['fuente'] = f"{item_bd.get('fuente', nombre)} · {pct:.0f}% similitud"
+            return construir_apu_desde_base(item_bd, valor_ofrecido)
+
+    return None  # no encontrado en ninguna fuente
+
+
+def generar_reporte_cobertura(items_con_apu, items_sin_apu) -> dict:
+    """
+    Genera reporte de cobertura para mostrar en la interfaz.
+    Retorna dict con estadísticas y listas clasificadas.
+    """
+    total = len(items_con_apu) + len(items_sin_apu)
+
+    # Clasificar los que tienen APU por fuente
+    por_fuente = {}
+    for item in items_con_apu:
+        fuente = item.get('fuente_bd', 'Entidad contratante')
+        if not fuente:
+            fuente = 'Entidad contratante'
+        por_fuente[fuente] = por_fuente.get(fuente, 0) + 1
+
+    return {
+        'total':          total,
+        'con_apu':        len(items_con_apu),
+        'sin_apu':        len(items_sin_apu),
+        'pct_cobertura':  round(len(items_con_apu) / total * 100, 1) if total > 0 else 0,
+        'por_fuente':     por_fuente,
+        'items_sin_apu':  [{'code': i['code'], 'description': i['description'],
+                             'unit': i['unit'], 'valor': i['valor_ofrecido']}
+                            for i in items_sin_apu],
+    }
