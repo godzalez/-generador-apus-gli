@@ -11,16 +11,260 @@ import io, re
 # UTILIDADES DE DETECCIÓN — importadas desde detector.py
 # ══════════════════════════════════════════════════════════════════
 from numero_letras import numero_a_letras
-from bases_externas import buscar_en_base, construir_apu_desde_base
-from detector import (
-    detectar_columnas as _detectar_columnas_ext,
-    es_fila_item_valida as _es_fila_item_valida_ext,
-    extraer_codigo as _extraer_codigo_ext,
-    es_codigo_item,
-    encontrar_hoja_presupuesto as _encontrar_hoja_presupuesto,
-)
 
-# Alias para compatibilidad con el resto del código
+# ══════════════════════════════════════════════════════════════════
+# DETECTOR INTELIGENTE DE COLUMNAS — GLI Colombia 2026
+# ══════════════════════════════════════════════════════════════════
+import unicodedata, re
+
+# ── Sinónimos por campo ───────────────────────────────────────────────────────
+# Orden interno: primero los más específicos/únicos, luego los genéricos
+SINONIMOS: dict[str, list[str]] = {
+    'col_codins': ['CODINS','COD INS','COD. INS','CODIGO INSUMO','COD INSUMO','INSUMO COD'],
+    'col_tipo':   ['TIPO','CLASE','CATEGORIA','CATEGORÍA','ROL','TIPO INSUMO','TIPO RECURSO'],
+    'col_parcial':['VR. PARCIAL','VR PARCIAL','PARCIAL','VALOR PARCIAL','V. PARCIAL','TOTAL PARCIAL'],
+    'col_total':  ['VR. TOTAL','VR TOTAL','COSTO DIRECTO','COSTO TOTAL','VALOR TOTAL','PRECIO TOTAL','V. TOTAL','TOTAL UNITARIO','CD','C.D.'],
+    'col_unit':   ['UNITARIO','VR. UNIT','VR UNIT','PRECIO UNIT','VALOR UNIT','V. UNIT','P.U.','PU','VALOR UNITARIO','COSTO UNIT','COSTO UNITARIO','TARIFA','V.U.'],
+    'col_rend':   ['REND','RENDIMIENTO','CANT','CANTIDAD','CANT.','CONSUMO','DESPERDICIO','FACTOR','COEFICIENTE','REND.','REND/CANT'],
+    'col_und':    ['UNIDAD','UND','UN','UND.','U/M','UM','UNID','MEDIDA','UNIDAD MEDIDA','UNIDAD DE MEDIDA'],
+    'col_desc':   ['INSUMO / DESCRIPCIÓN','INSUMO/DESCRIPCION','INSUMO / DESCRIPCION','DESCRIPCION','DESCRIPCIÓN','DETALLE','CONCEPTO','RECURSO','INSUMO','NOMBRE','ACTIVIDAD','MATERIAL'],
+    'col_codigo': ['CODIGO ITEM','COD. ITEM','CODIGO','COD','ITEM','ÍTEM','NUM','NÚMERO','NO.','N°','REF'],
+}
+
+# Tipos que marcan una ACTIVIDAD principal
+TIPOS_ACTIVIDAD = {'ACTIVIDAD','ITEM','ÍTEM','APU','ANALISIS','ANÁLISIS','ANALISIS DE PRECIO'}
+
+# Mapeo TIPO → sección interna
+TIPOS_SECCION: dict[str, list[str]] = {
+    'mano_de_obra': ['CUADRILLA','MANO DE OBRA','MO','PERSONAL','JORNAL','OPERARIO','OBRERO','TRABAJADOR'],
+    'herramientas': ['EQUIPO','EQUIPOS','HERRAMIENTA','HERRAMIENTAS','MAQUINARIA','MAQUINA','MÁQUINA','EQUIPO MENOR'],
+    'transporte':   ['TRANSPORTE','FLETE','ACARREO','MOVILIZACION','MOVILIZACIÓN'],
+    'materiales':   ['INSUMO','INSUMOS','MATERIAL','MATERIALES','ANALISIS BASICO','ANÁLISIS BÁSICO','ANALISIS BÁSICO','ENSAYO','SUBCONTRATO','OTRO','OTROS'],
+}
+
+def _norm(s) -> str:
+    t = str(s).upper().strip()
+    t = ''.join(c for c in unicodedata.normalize('NFD', t) if unicodedata.category(c) != 'Mn')
+    return re.sub(r'\s+', ' ', t)
+
+def _score(header: str, synonyms: list[str]) -> int:
+    h = _norm(header)
+    for s in synonyms:
+        sn = _norm(s)
+        if h == sn:           return 3   # exacto
+        if sn in h:           return 2   # sinónimo contenido en header
+        if h in sn and len(h) >= 4: return 1  # header contenido en sinónimo
+    return 0
+
+def detectar_columnas_apu(ws, max_filas: int = 10) -> dict:
+    """
+    Detecta la fila de encabezados y mapea cada campo crítico al índice de columna.
+    Cada columna solo puede ser asignada a UN campo (asignación exclusiva por prioridad).
+    """
+    mejor_fila = 0
+    mejor_score = 0
+    mejor_resultado = {}
+    mejor_enc = []
+
+    for fi in range(min(max_filas, ws.max_row)):
+        fila = [c.value for c in ws[fi + 1]]
+        if not any(fila):
+            continue
+
+        # Calcular score de cada (campo, columna)
+        scores: dict[str, dict[int, int]] = {campo: {} for campo in SINONIMOS}
+        for ci, celda in enumerate(fila):
+            if not celda:
+                continue
+            for campo, sinons in SINONIMOS.items():
+                s = _score(str(celda), sinons)
+                if s > 0:
+                    scores[campo][ci] = s
+
+        # Asignación greedy: campo con mayor score gana la columna
+        # Prioridad de campos: primero los más específicos (orden de SINONIMOS)
+        asignado: dict[int, str] = {}   # col → campo
+        mapa: dict[str, int] = {}       # campo → col
+        total_score = 0
+
+        for campo in SINONIMOS:
+            if not scores[campo]:
+                continue
+            # Escoger columna con mayor score que no esté asignada
+            mejor_col = max(
+                (ci for ci in scores[campo] if ci not in asignado),
+                key=lambda ci: scores[campo][ci],
+                default=None
+            )
+            if mejor_col is not None:
+                mapa[campo] = mejor_col
+                asignado[mejor_col] = campo
+                total_score += scores[campo][mejor_col]
+
+        if total_score > mejor_score:
+            mejor_score = total_score
+            mejor_fila  = fi
+            mejor_resultado = mapa
+            mejor_enc = [str(c) if c else '' for c in fila]
+
+    # Detectar variante de formato
+    variante = _detectar_variante(ws, mejor_fila + 2, mejor_resultado)
+
+    # Calcular confianza
+    criticos = {'col_codigo','col_desc','col_rend','col_unit','col_total'}
+    encontrados = criticos & set(mejor_resultado)
+    confianza = 'alta' if len(encontrados) >= 4 else ('media' if len(encontrados) >= 2 else 'baja')
+
+    return {
+        'fila_enc':    mejor_fila,
+        'mapa':        mejor_resultado,
+        'confianza':   confianza,
+        'variante':    variante,
+        'encabezados': mejor_enc,
+        'puntaje':     mejor_score,
+    }
+
+def _detectar_variante(ws, fila_inicio: int, mapa: dict) -> str:
+    ci_tipo   = mapa.get('col_tipo')
+    ci_codins = mapa.get('col_codins')
+    tipos_ok  = set()
+    codins_ok = set()
+    for row in ws.iter_rows(min_row=fila_inicio, max_row=fila_inicio + 20, values_only=True):
+        if ci_tipo is not None and ci_tipo < len(row) and row[ci_tipo]:
+            tipos_ok.add(_norm(str(row[ci_tipo])))
+        if ci_codins is not None and ci_codins < len(row) and row[ci_codins]:
+            codins_ok.add(str(row[ci_codins]).strip())
+    tipos_conocidos = TIPOS_ACTIVIDAD | {_norm(t) for lst in TIPOS_SECCION.values() for t in lst}
+    if tipos_ok & tipos_conocidos:
+        return 'tipo_columna'
+    if '-' in codins_ok:
+        return 'codins_marca'
+    return 'desconocido'
+
+def clasificar_seccion(valor_tipo: str) -> str:
+    t = _norm(valor_tipo)
+    for seccion, palabras in TIPOS_SECCION.items():
+        for p in palabras:
+            pn = _norm(p)
+            if pn == t: return seccion
+    for seccion, palabras in TIPOS_SECCION.items():
+        for p in palabras:
+            pn = _norm(p)
+            if len(pn) >= 3 and re.search(r'\\b' + re.escape(pn) + r'\\b', t):
+                return seccion
+    return 'materiales'
+
+def es_actividad(valor_tipo: str) -> bool:
+    t = _norm(valor_tipo)
+    return any(_norm(x) in t or t in _norm(x) for x in TIPOS_ACTIVIDAD)
+
+def leer_apu_con_detector(ws) -> tuple[dict, str | None]:
+    """
+    Lee APUs de una hoja usando detección automática de columnas.
+    Soporta variante A (CODINS='-') y variante B (columna TIPO).
+    """
+    det = detectar_columnas_apu(ws)
+    mapa     = det['mapa']
+    variante = det['variante']
+    fila_ini = det['fila_enc'] + 2
+
+    if det['confianza'] == 'baja':
+        return {}, (
+            f"Columnas no reconocidas (puntaje={det['puntaje']}, "
+            f"campos={list(mapa.keys())}). "
+            f"Encabezados: {det['encabezados'][:8]}"
+        )
+
+    i_cod    = mapa.get('col_codigo')
+    i_codins = mapa.get('col_codins')
+    i_desc   = mapa.get('col_desc')
+    i_tipo   = mapa.get('col_tipo')
+    i_und    = mapa.get('col_und')
+    i_rend   = mapa.get('col_rend')
+    i_unit   = mapa.get('col_unit')
+    i_parc   = mapa.get('col_parcial')
+    i_total  = mapa.get('col_total')
+
+    def _get(row, idx):
+        return row[idx] if (idx is not None and idx < len(row)) else None
+
+    bd: dict[str, dict] = {}
+    current = None
+
+    for row in ws.iter_rows(min_row=fila_ini, values_only=True):
+        if not any(row):
+            continue
+
+        cod_v   = _get(row, i_cod)
+        codins  = str(_get(row, i_codins) or '').strip()
+        desc    = str(_get(row, i_desc)   or '').strip()
+        tipo_v  = str(_get(row, i_tipo)   or '').strip()
+        und     = str(_get(row, i_und)    or '').strip()
+        rend    = _get(row, i_rend)
+        unit    = _get(row, i_unit)
+        parc    = _get(row, i_parc)
+        total   = _get(row, i_total)
+        cod_str = str(cod_v).strip() if cod_v else ''
+
+        # ── ¿Es actividad? ────────────────────────────────────────────────────
+        es_act = False
+        if variante == 'tipo_columna':
+            es_act = bool(tipo_v) and es_actividad(tipo_v) and codins == '-'
+        elif variante == 'codins_marca':
+            es_act = codins == '-'
+        else:
+            es_act = (
+                isinstance(total, (int, float)) and total > 0
+                and not isinstance(rend, (int, float))
+                and not isinstance(unit, (int, float))
+                and bool(cod_str)
+            )
+
+        if es_act and cod_str:
+            current = cod_str
+            bd[current] = {
+                'total_referencia': float(total) if isinstance(total, (int, float)) else 0,
+                'descripcion':      desc,
+                'materiales':       [],
+                'herramientas':     [],
+                'transporte':       [],
+                'mano_de_obra':     [],
+            }
+            continue
+
+        # ── Componente ────────────────────────────────────────────────────────
+        if not current:
+            continue
+        if not isinstance(rend, (int, float)) or not isinstance(unit, (int, float)):
+            continue
+        if rend == 0 and unit == 0:
+            continue
+
+        parc_val = float(parc) if isinstance(parc, (int, float)) else round(float(rend) * float(unit), 0)
+        comp = {
+            'description': desc, 'unit': und,
+            'rend': float(rend), 'unit_price': float(unit),
+            'parcial': parc_val, '_rend_ajustado': False,
+        }
+
+        if tipo_v:
+            seccion = clasificar_seccion(tipo_v)
+        else:
+            d = _norm(desc)
+            if any(x in d for x in ('CUADRILLA','JORNAL','OFICIAL','AYUDANTE','OBRERO')):
+                seccion = 'mano_de_obra'
+            elif any(x in d for x in ('EQUIPO','MAQUINARIA','HERRAMIENTA')):
+                seccion = 'herramientas'
+            elif any(x in d for x in ('TRANSPORTE','FLETE','ACARREO')):
+                seccion = 'transporte'
+            else:
+                seccion = 'materiales'
+
+        bd[current][seccion].append(comp)
+
+    return bd, None
+
+
 def _detectar_columnas(ws):     return _detectar_columnas_ext(ws)
 def _es_fila_item(r, m):        return _es_fila_item_valida_ext(r, m)
 def _extraer_codigo(r, m):      return _extraer_codigo_ext(r, m)
@@ -159,38 +403,98 @@ def _leer_hojas_apu_individuales(wb):
 # ══════════════════════════════════════════════════════════════════
 
 def _leer_hoja_apu_columnar(ws_apu):
-    """Lee hoja APU en formato columnar estándar (CODINS='-')."""
+    """
+    Lee hoja APU usando el detector inteligente de columnas.
+    Reconoce automáticamente el formato de cualquier entidad colombiana.
+    """
+    bd, err = leer_apu_con_detector(ws_apu)
+    if err:
+        return {}
+    return bd
+
+def _leer_hoja_apu_columnar_legacy(ws_apu):
+    """Versión anterior — conservada como respaldo."""
+    import unicodedata as _ud
+    def _norm(s):
+        s = str(s).upper().strip()
+        return ''.join(c for c in _ud.normalize('NFD', s) if _ud.category(c) != 'Mn')
+
     bd = {}
     current = None
     primera = [c.value for c in ws_apu[1]]
     fila_ini = 2 if any(v and 'CODIGO' in str(v).upper() for v in primera if v) else 1
+
+    # Detectar variante B: tiene columna TIPO con valores 'Actividad','Cuadrilla', etc.
+    muestra = []
+    for row in ws_apu.iter_rows(min_row=fila_ini, max_row=fila_ini+15, values_only=True):
+        if row[3]: muestra.append(_norm(str(row[3])))
+    variante_b = any(x in muestra for x in ('ACTIVIDAD','CUADRILLA','INSUMOS','HERRAMIENTA'))
+
     for row in ws_apu.iter_rows(min_row=fila_ini, values_only=True):
         if not row[0]: continue
         code   = str(row[0]).strip()
         codins = str(row[1]).strip() if row[1] is not None else ''
         insumo = str(row[2]).strip() if row[2] else ''
-        tipo   = str(row[3]).strip() if row[3] else ''
+        tipo   = _norm(row[3]) if row[3] else ''
         unit   = str(row[4]).strip() if row[4] else ''
-        rend   = row[5]; uprice = row[6]; total = row[8]
+        rend   = row[5]; uprice = row[6]
+        # total puede estar en col 7 (VR.PARCIAL no aplica) o col 8 (VR.TOTAL)
+        total  = row[8] if len(row) > 8 else (row[7] if len(row) > 7 else None)
+
         if not tipo: continue
-        if codins == '-':
-            current = code
-            bd[code] = {'total_referencia': float(total) if total else 0,
-                        'materiales':[],'herramientas':[],'transporte':[],'mano_de_obra':[]}
-        elif current and code == current and rend is not None and uprice is not None:
-            comp = {'description': insumo, 'unit': unit,
-                    'rend': float(rend), 'unit_price': float(uprice)}
-            t = tipo.lower()
-            if any(x in t for x in ('insumo','analisis basico','actividad','ensayo')):
-                bd[current]['materiales'].append(comp)
-            elif any(x in t for x in ('herramienta','equipo')):
-                bd[current]['herramientas'].append(comp)
-            elif any(x in t for x in ('cuadrilla','personal')):
-                bd[current]['mano_de_obra'].append(comp)
-            elif 'transporte' in t:
-                bd[current]['transporte'].append(comp)
-            else:
-                bd[current]['materiales'].append(comp)
+
+        # ── Variante B: TIPO indica el rol de cada fila ───────────────────────
+        if variante_b:
+            if tipo == 'ACTIVIDAD' and codins == '-':
+                current = code
+                bd[code] = {
+                    'total_referencia': float(total) if isinstance(total,(int,float)) else 0,
+                    'materiales':[],'herramientas':[],'transporte':[],'mano_de_obra':[]
+                }
+            elif current and isinstance(rend,(int,float)) and isinstance(uprice,(int,float)):
+                if rend == 0 and uprice == 0: continue
+                comp = {
+                    'description': insumo, 'unit': unit,
+                    'rend': float(rend), 'unit_price': float(uprice),
+                    'parcial': round(float(rend)*float(uprice), 0),
+                    '_rend_ajustado': False,
+                }
+                if any(x in tipo for x in ('CUADRILLA','PERSONAL')):
+                    bd[current]['mano_de_obra'].append(comp)
+                elif any(x in tipo for x in ('EQUIPO',)):
+                    bd[current]['herramientas'].append(comp)
+                elif 'HERRAMIENTA' in tipo:
+                    bd[current]['herramientas'].append(comp)
+                elif 'TRANSPORTE' in tipo:
+                    bd[current]['transporte'].append(comp)
+                else:  # Insumos, Analisis Basico, otros
+                    bd[current]['materiales'].append(comp)
+
+        # ── Variante A: CODINS='-' marca actividad ───────────────────────────
+        else:
+            if codins == '-':
+                current = code
+                bd[code] = {
+                    'total_referencia': float(total) if isinstance(total,(int,float)) else 0,
+                    'materiales':[],'herramientas':[],'transporte':[],'mano_de_obra':[]
+                }
+            elif current and code == current and isinstance(rend,(int,float)) and isinstance(uprice,(int,float)):
+                comp = {
+                    'description': insumo, 'unit': unit,
+                    'rend': float(rend), 'unit_price': float(uprice),
+                    'parcial': round(float(rend)*float(uprice), 0),
+                    '_rend_ajustado': False,
+                }
+                if any(x in tipo for x in ('INSUMO','ANALISIS BASICO','ENSAYO')):
+                    bd[current]['materiales'].append(comp)
+                elif any(x in tipo for x in ('HERRAMIENTA','EQUIPO')):
+                    bd[current]['herramientas'].append(comp)
+                elif any(x in tipo for x in ('CUADRILLA','PERSONAL')):
+                    bd[current]['mano_de_obra'].append(comp)
+                elif 'TRANSPORTE' in tipo:
+                    bd[current]['transporte'].append(comp)
+                else:
+                    bd[current]['materiales'].append(comp)
     return bd
 
 def _construir_mapa_codigos(wb):
