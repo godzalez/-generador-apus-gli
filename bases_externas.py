@@ -243,3 +243,211 @@ def construir_apu_desde_base(item_bd, valor_ofrecido):
         'codigo_bd':    item_bd['codigo'],
         'total_referencia': total_ref,
     }
+
+
+# ══════════════════════════════════════════════════════════════════
+# CATÁLOGO POLICÍA NACIONAL 2026 — Cargador dedicado
+# Fuente: 10. PRESUPUESTO APU ESPECIFICACIONES TECNICAS PARTICULARES.xlsx
+# Código oficial: 1LF-FR-0206 · Vigencia 2026
+# ══════════════════════════════════════════════════════════════════
+
+import pandas as pd
+
+def _zona_col(zona: str) -> str:
+    """Mapea zona A1..A6 al nombre de columna en las hojas del catálogo."""
+    return {
+        "A1": "A1", "A2": "A2", "A3": "A3",
+        "A4": "A4", "A5": "A5", "A6": "A6",
+    }.get(zona.upper(), "A1")
+
+
+def cargar_catalogo_policia(ruta_archivo, zona: str = "A1"):
+    """
+    Carga el catálogo Policía Nacional 2026 y retorna cuatro diccionarios:
+      actividades : {codigo → {descripcion, unidad, precio}}
+      insumos     : {descripcion_norm → {descripcion, unidad, precio}}
+      equipos     : {descripcion_norm → {descripcion, unidad, precio_hora}}
+      mano_obra   : {descripcion_norm → {descripcion, unidad, precio_hora}}
+
+    zona: 'A1'..'A6' — selecciona la columna de precio correspondiente.
+    """
+    try:
+        xls = pd.ExcelFile(ruta_archivo)
+    except Exception as e:
+        return {}, {}, {}, {}, f"No se pudo abrir el catálogo Policía: {e}"
+
+    zona = zona.upper()
+    col_precio_act  = f"VR. UNIT."    # LISTADO ACTIVIDADES usa nombres A1..A6 en fila 0
+    col_precio_insumo = "Vigencia 2026"
+    col_precio_equipo = f"COSTO  {zona}"  # EQUIPOS: "COSTO  A1", "COSTO  A2", etc.
+
+    # ── ACTIVIDADES PRE-TARIFADAS ─────────────────────────────────────────────
+    actividades = {}
+    try:
+        df_act = pd.read_excel(ruta_archivo, sheet_name="LISTADO ACTIVIDADES", header=None)
+        # Fila 0: encabezados. Columnas: 0=CAP, 1=Código, 2=ACTIVIDAD, 3=UN, 4=A1..9=A6
+        # Detectar columna de zona (A1=col4, A2=col5 ... A6=col9)
+        zona_idx = {"A1": 4, "A2": 5, "A3": 6, "A4": 7, "A5": 8, "A6": 9}
+        col_z = zona_idx.get(zona, 4)
+        for _, row in df_act.iterrows():
+            cod = str(row.iloc[1]).strip() if pd.notna(row.iloc[1]) else ""
+            desc = str(row.iloc[2]).strip() if pd.notna(row.iloc[2]) else ""
+            und = str(row.iloc[3]).strip() if pd.notna(row.iloc[3]) else ""
+            precio = row.iloc[col_z] if col_z < len(row) else None
+            if not cod or not desc or cod in ("NaN", "nan", "CAP.", "ACTIVIDAD"):
+                continue
+            if not isinstance(precio, (int, float)) or precio <= 0:
+                continue
+            actividades[cod] = {
+                "codigo":      cod,
+                "descripcion": desc,
+                "unidad":      und,
+                "precio":      float(precio),
+                "zona":        zona,
+                "fuente":      "Catálogo Policía 1LF-FR-0206 · 2026",
+            }
+    except Exception as e:
+        pass   # hoja no encontrada — continuar con las demás
+
+    # ── INSUMOS (precio único nacional) ──────────────────────────────────────
+    insumos = {}
+    try:
+        df_ins = pd.read_excel(ruta_archivo, sheet_name="INSUMOS", header=0)
+        # Columnas: Descripción, UND, Vigencia 2026
+        for _, row in df_ins.iterrows():
+            desc = str(row.iloc[0]).strip() if pd.notna(row.iloc[0]) else ""
+            und  = str(row.iloc[1]).strip() if pd.notna(row.iloc[1]) else ""
+            precio = row.iloc[2] if len(row) > 2 else None
+            if not desc or desc in ("Descripción",):
+                continue
+            if not isinstance(precio, (int, float)) or precio <= 0:
+                continue
+            key = _norm(desc)
+            insumos[key] = {
+                "descripcion": desc,
+                "unidad":      und,
+                "precio":      float(precio),
+                "fuente":      "Catálogo Policía 1LF-FR-0206 · 2026 · Insumos",
+            }
+    except Exception:
+        pass
+
+    # ── EQUIPOS (precio por zona) ─────────────────────────────────────────────
+    equipos = {}
+    try:
+        df_eq = pd.read_excel(ruta_archivo, sheet_name="EQUIPOS", header=None)
+        # Fila 0: PRECIOS ALQUILER... Fila 1: DESCRIPCIÓN, UND, COSTO A1..COSTO A6
+        # Detectar columna de zona desde fila 1
+        header_row = list(df_eq.iloc[1])
+        col_zona_eq = None
+        for j, h in enumerate(header_row):
+            if h and isinstance(h, str) and zona in str(h).upper():
+                col_zona_eq = j
+                break
+        if col_zona_eq is None:
+            col_zona_eq = {"A1":2,"A2":3,"A3":4,"A4":5,"A5":6,"A6":7}.get(zona, 2)
+        for _, row in df_eq.iloc[2:].iterrows():
+            desc = str(row.iloc[0]).strip() if pd.notna(row.iloc[0]) else ""
+            und  = str(row.iloc[1]).strip() if pd.notna(row.iloc[1]) else ""
+            precio = row.iloc[col_zona_eq] if col_zona_eq < len(row) else None
+            if not desc or not isinstance(precio, (int, float)) or precio <= 0:
+                continue
+            key = _norm(desc)
+            equipos[key] = {
+                "descripcion": desc,
+                "unidad":      und,
+                "precio_hora": float(precio),
+                "zona":        zona,
+                "fuente":      "Catálogo Policía 1LF-FR-0206 · 2026 · Equipos",
+            }
+    except Exception:
+        pass
+
+    # ── MANO DE OBRA (precio por zona) ───────────────────────────────────────
+    mano_obra = {}
+    try:
+        df_mo = pd.read_excel(ruta_archivo, sheet_name="MANO DE OBRA", header=None)
+        # Estructura variable — buscar filas con valor numérico > 0 en la columna de zona
+        # Fila 11: encabezado con DESCRIPCIÓN, UNIDAD, VALOR UNITARIO, etc.
+        # Las tarifas individuales y cuadrillas están en col2 (valor sin FP)
+        # Para zona A1 usar col2; para otras zonas buscar col correspondiente
+        # Simplificación robusta: leer todo y filtrar filas numéricas con descripción
+        for _, row in df_mo.iterrows():
+            desc = str(row.iloc[0]).strip() if pd.notna(row.iloc[0]) else ""
+            und  = str(row.iloc[1]).strip() if pd.notna(row.iloc[1]) else ""
+            # La tarifa sin factor prestacional está en col 2
+            # Usar col 2 para A1; para otras zonas multiplicar por el factor de zona
+            from salarios import MULTIPLICADORES_ZONA
+            tarifa_base = row.iloc[2] if len(row) > 2 else None
+            if not desc or len(desc) < 5:
+                continue
+            if not isinstance(tarifa_base, (int, float)) or tarifa_base <= 0:
+                continue
+            # Filtrar encabezados y filas no-tarifa
+            if any(x in desc.upper() for x in ("DESCRIPCI", "SALARIO", "CLASIFIC",
+                                                 "PERSONAL", "CUADRILLA", "ESTRUCTURA")):
+                # "CUADRILLA" puede ser encabezado de sección — ignorar si no tiene número
+                if not isinstance(tarifa_base, float) or tarifa_base > 50_000_000:
+                    continue
+            mult = MULTIPLICADORES_ZONA.get(zona, 1.0)
+            precio_zona = round(float(tarifa_base) * mult, 6)
+            key = _norm(desc)
+            mano_obra[key] = {
+                "descripcion":  desc,
+                "unidad":       und if und else "mes",
+                "precio_hora":  precio_zona,
+                "precio_base":  float(tarifa_base),
+                "zona":         zona,
+                "fuente":       "Catálogo Policía 1LF-FR-0206 · 2026 · Mano de Obra",
+            }
+    except Exception:
+        pass
+
+    return actividades, insumos, equipos, mano_obra, None
+
+
+def buscar_actividad_policia(descripcion: str, unidad: str,
+                              actividades: dict, top_n: int = 5,
+                              umbral_pct: int = 25) -> list:
+    """
+    Busca actividades del catálogo Policía por similitud de descripción.
+    Retorna lista de (score, pct, item) ordenada por relevancia.
+    """
+    palabras = {p for p in _norm(descripcion).split()
+                if len(p) >= 4 and p not in _STOPWORDS}
+    if not palabras:
+        return []
+    und_norm = _norm(unidad) if unidad else ""
+    resultados = []
+    for item in actividades.values():
+        palabras_item = set(_norm(item["descripcion"]).split())
+        coincidencias = len(palabras & palabras_item)
+        if coincidencias == 0:
+            continue
+        pct = coincidencias / len(palabras) * 100
+        if pct < umbral_pct:
+            continue
+        bonus = 0.5 if und_norm and und_norm == _norm(item["unidad"]) else 0
+        resultados.append((coincidencias + bonus, pct, item))
+    resultados.sort(key=lambda x: -x[0])
+    return resultados[:top_n]
+
+
+def precio_insumo_policia(descripcion: str, insumos: dict) -> dict | None:
+    """
+    Busca el precio de un insumo en el catálogo Policía por nombre exacto o similar.
+    Retorna el ítem más cercano o None si no hay coincidencia con score > 50%.
+    """
+    palabras = {p for p in _norm(descripcion).split()
+                if len(p) >= 4 and p not in _STOPWORDS}
+    if not palabras:
+        return None
+    mejor = None
+    mejor_score = 0
+    for key, item in insumos.items():
+        palabras_item = set(key.split())
+        score = len(palabras & palabras_item) / len(palabras)
+        if score > mejor_score:
+            mejor_score = score
+            mejor = item
+    return mejor if mejor_score >= 0.5 else None

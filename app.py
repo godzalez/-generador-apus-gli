@@ -28,7 +28,41 @@ with st.sidebar:
     else:
         st.success("Sin AIU — precio = costo directo")
     st.divider()
-    st.caption("v10.0 · GLI Colombia · 2026")
+
+    st.subheader("📚 Catálogo Policía Nacional 2026")
+    uploaded_catalogo = st.file_uploader(
+        "Cargar catálogo oficial (1LF-FR-0206)",
+        type=["xlsx", "xlsm"], key="catalogo_policia",
+        help="Archivo: 10. PRESUPUESTO APU ESPECIFICACIONES TECNICAS PARTICULARES.xlsx"
+    )
+    zona_proceso = st.selectbox(
+        "Zona de accesibilidad del proceso",
+        ["A1","A2","A3","A4","A5","A6"],
+        index=0,
+        help="A1=grandes ciudades · A4=municipios <50k hab · A6=zona remota"
+    )
+    catalogo_policia = {}
+    if uploaded_catalogo:
+        from bases_externas import cargar_catalogo_policia
+        import io
+        data_cat = uploaded_catalogo.read()
+        act, ins, eq, mo, err_cat = cargar_catalogo_policia(
+            io.BytesIO(data_cat), zona=zona_proceso
+        )
+        if err_cat:
+            st.error(f"❌ {err_cat}")
+        else:
+            catalogo_policia = {"actividades": act, "insumos": ins,
+                                 "equipos": eq, "mano_obra": mo, "zona": zona_proceso}
+            st.success(
+                f"✅ Catálogo cargado — zona **{zona_proceso}**  \n"
+                f"{len(act)} actividades · {len(ins)} insumos · "
+                f"{len(eq)} equipos · {len(mo)} recursos MO"
+            )
+    elif not uploaded_catalogo:
+        st.info("Opcional: cargue el catálogo Policía para sustentar APUs con precios oficiales.")
+    st.divider()
+    st.caption("v11.0 · GLI Colombia · 2026")
 
 # ══════════════════════════════════════════════════════════════════
 # PASO 1

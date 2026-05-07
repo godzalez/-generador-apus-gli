@@ -441,13 +441,13 @@ def leer_oferta_economica(uploaded_file, bd_referencia=None):
             continue
 
         ofrecido = item['valor_ofrecido']
-        delta    = ofrecido - ref          # positivo: ofrece más; negativo: ofrece menos
 
-        # Copiar componentes de referencia (UNITARIO intacto — tarifa oficial)
+        # Copiar componentes de referencia — precios unitarios intactos (tarifas oficiales)
         for sec in ('materiales', 'herramientas', 'transporte', 'mano_de_obra'):
             item[sec] = [dict(c) for c in apu[sec]]
+            for c in item[sec]:
+                c['_rend_ajustado'] = False   # marca de trazabilidad
 
-        # Calcular totales por sección
         def _total_sec(comps):
             return sum(c['rend'] * c['unit_price'] for c in comps
                        if c['unit_price'] > 0 and c['rend'] > 0)
@@ -455,47 +455,66 @@ def leer_oferta_economica(uploaded_file, bd_referencia=None):
         mo_ref    = _total_sec(item['mano_de_obra'])
         equip_ref = _total_sec(item['herramientas']) + _total_sec(item['transporte'])
         mat_ref   = _total_sec(item['materiales'])
+        total_ref = mo_ref + equip_ref + mat_ref
 
-        delta_restante = delta
-
-        # ── Regla 1: ajustar REND de mano de obra primero ────────────────────
-        if mo_ref > 0 and delta_restante != 0:
-            mo_nuevo = mo_ref + delta_restante
-            mo_min   = mo_ref * 0.30   # mínimo: 30% del rendimiento original
-            mo_max   = mo_ref * 2.50   # máximo: 250% del rendimiento original
-            mo_nuevo = max(mo_min, min(mo_max, mo_nuevo))
-            factor_mo = mo_nuevo / mo_ref
-            for c in item['mano_de_obra']:
-                if c['unit_price'] > 0 and c['rend'] > 0:
-                    c['rend'] = round(c['rend'] * factor_mo, 6)
-            delta_restante -= (mo_nuevo - mo_ref)
-
-        # ── Regla 2: si queda diferencia, ajustar REND de equipos/herramienta ─
-        if equip_ref > 0 and abs(delta_restante) > 1:
-            equip_nuevo = equip_ref + delta_restante
-            equip_min   = equip_ref * 0.20
-            equip_max   = equip_ref * 3.00
-            equip_nuevo = max(equip_min, min(equip_max, equip_nuevo))
-            factor_eq   = equip_nuevo / equip_ref
-            for sec in ('herramientas', 'transporte'):
+        # Si el precio ofrecido ya cuadra con la referencia (tolerancia $1), no tocar nada
+        if abs(ofrecido - total_ref) <= 1:
+            for sec in ('materiales', 'herramientas', 'transporte', 'mano_de_obra'):
                 for c in item[sec]:
-                    if c['unit_price'] > 0 and c['rend'] > 0:
-                        c['rend'] = round(c['rend'] * factor_eq, 6)
-            delta_restante -= (equip_nuevo - equip_ref)
+                    c['parcial'] = round(c['rend'] * c['unit_price'], 0)
+            item['tiene_apu'] = True
+            continue
 
-        # ── Regla 3 (último recurso): ajustar UNITARIO de materiales ─────────
+        delta_restante = ofrecido - total_ref
+
+        # ── PASO 1: ajustar RENDIMIENTO de mano de obra (columna F) ──────────
+        # Regla: modificar solo el rendimiento, nunca el valor unitario (tarifa oficial).
+        # Límites técnicos: mín 20% del original, máx 300% del original.
+        if mo_ref > 0:
+            mo_objetivo = mo_ref + delta_restante
+            mo_min      = mo_ref * 0.20
+            mo_max      = mo_ref * 3.00
+            mo_ajustado = max(mo_min, min(mo_max, mo_objetivo))
+            factor_mo   = mo_ajustado / mo_ref
+            if abs(factor_mo - 1.0) > 0.0001:   # solo si hay cambio real
+                for c in item['mano_de_obra']:
+                    if c['unit_price'] > 0 and c['rend'] > 0:
+                        c['rend']           = round(c['rend'] * factor_mo, 6)
+                        c['_rend_ajustado'] = True
+            delta_restante -= (mo_ajustado - mo_ref)
+
+        # ── PASO 2: si queda diferencia, ajustar RENDIMIENTO de herramienta ──
+        # Solo si el delta residual supera $1 (diferencia real, no redondeo).
+        if equip_ref > 0 and abs(delta_restante) > 1:
+            equip_objetivo = equip_ref + delta_restante
+            equip_min      = equip_ref * 0.20
+            equip_max      = equip_ref * 3.00
+            equip_ajustado = max(equip_min, min(equip_max, equip_objetivo))
+            factor_eq      = equip_ajustado / equip_ref
+            if abs(factor_eq - 1.0) > 0.0001:
+                for sec in ('herramientas', 'transporte'):
+                    for c in item[sec]:
+                        if c['unit_price'] > 0 and c['rend'] > 0:
+                            c['rend']           = round(c['rend'] * factor_eq, 6)
+                            c['_rend_ajustado'] = True
+            delta_restante -= (equip_ajustado - equip_ref)
+
+        # ── PASO 3 (último recurso): ajustar VALOR UNITARIO de insumos ───────
+        # Solo si todavía queda diferencia > $1 después de MO y equipos.
+        # Se ajusta el precio unitario (columna G), no el rendimiento.
+        # Límites: mín 60% del original, máx 160% del original.
         if mat_ref > 0 and abs(delta_restante) > 1:
-            mat_nuevo = mat_ref + delta_restante
-            mat_min   = mat_ref * 0.60
-            mat_max   = mat_ref * 1.60
-            mat_nuevo = max(mat_min, min(mat_max, mat_nuevo))
-            factor_mat = mat_nuevo / mat_ref
+            mat_objetivo = mat_ref + delta_restante
+            mat_min      = mat_ref * 0.60
+            mat_max      = mat_ref * 1.60
+            mat_ajustado = max(mat_min, min(mat_max, mat_objetivo))
+            factor_mat   = mat_ajustado / mat_ref
             for c in item['materiales']:
                 if c['unit_price'] > 0 and c['rend'] > 0:
-                    # Para materiales: ajustar UNITARIO (precio de mercado)
-                    c['unit_price'] = max(1, int(round(c['unit_price'] * factor_mat, 0)))
+                    c['unit_price']     = max(1, int(round(c['unit_price'] * factor_mat, 0)))
+                    c['_rend_ajustado'] = True   # marca: este componente fue tocado
 
-        # Recalcular parciales con los valores finales
+        # ── Recalcular parciales finales ──────────────────────────────────────
         for sec in ('materiales', 'herramientas', 'transporte', 'mano_de_obra'):
             for c in item[sec]:
                 c['parcial'] = round(c['rend'] * c['unit_price'], 0)
@@ -644,9 +663,13 @@ def _build_apu_sheet(ws, item, include_aiu=False, aiu_pct=0.0):
             if comp:
                 ws[f'A{r}'] = comp['description']
                 ws[f'E{r}'] = comp['unit'] if comp.get('unit') else ''
-                ws[f'F{r}'] = round(comp['rend'], 4)          # rendimiento: hasta 4 decimales
-                ws[f'G{r}'] = int(round(comp['unit_price'], 0))  # VR UNIT: 0 decimales
-                ws[f'H{r}'] = f'=ROUND(F{r}*G{r},0)'
+                ws[f'F{r}'] = round(comp['rend'], 4)
+                ws[f'G{r}'] = int(round(comp['unit_price'], 0))
+                # Regla crítica: fila ajustada → =F*G sin redondeo; intacta → =ROUND(F*G,0)
+                if comp.get('_rend_ajustado'):
+                    ws[f'H{r}'] = f'=F{r}*G{r}'
+                else:
+                    ws[f'H{r}'] = f'=ROUND(F{r}*G{r},0)' 
             for col, al, fmt in [
                 ('A',left_w,None),('E',center,None),
                 ('F',right,'#,##0.0000'),('G',right,CUR),('H',right,CUR)]:
