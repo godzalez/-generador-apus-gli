@@ -159,170 +159,38 @@ def _leer_hojas_apu_individuales(wb):
 # ══════════════════════════════════════════════════════════════════
 
 def _leer_hoja_apu_columnar(ws_apu):
-    """
-    Lee hoja APU usando detección inteligente de columnas.
-    Soporta cualquier formato de entidad colombiana — detecta columnas por nombre.
-    """
-    import unicodedata, re as _re
-
-    # ── Sinónimos por campo (más específicos primero) ─────────────────────
-    SINONIMOS = {
-        'col_codins':  ['CODINS','COD INS','COD. INS','CODIGO INSUMO','COD INSUMO'],
-        'col_tipo':    ['TIPO','CLASE','CATEGORIA','CATEGORÍA','ROL','TIPO INSUMO'],
-        'col_parcial': ['VR. PARCIAL','VR PARCIAL','PARCIAL','VALOR PARCIAL','V. PARCIAL'],
-        'col_total':   ['VR. TOTAL','VR TOTAL','COSTO DIRECTO','COSTO TOTAL','VALOR TOTAL','PRECIO TOTAL','V. TOTAL','TOTAL UNITARIO','CD'],
-        'col_unit':    ['UNITARIO','VR. UNIT','VR UNIT','PRECIO UNIT','VALOR UNIT','P.U.','VALOR UNITARIO','COSTO UNITARIO','TARIFA'],
-        'col_rend':    ['REND','RENDIMIENTO','CANT','CANTIDAD','CONSUMO','DESPERDICIO','FACTOR','COEFICIENTE'],
-        'col_und':     ['UNIDAD','UND','UN','UND.','U/M','UNID','MEDIDA'],
-        'col_desc':    ['INSUMO / DESCRIPCIÓN','INSUMO/DESCRIPCION','INSUMO / DESCRIPCION','DESCRIPCION','DESCRIPCIÓN','DETALLE','INSUMO','NOMBRE','ACTIVIDAD'],
-        'col_codigo':  ['CODIGO ITEM','COD. ITEM','CODIGO','COD','ITEM','ÍTEM','NUM','N°','REF'],
-    }
-    TIPOS_ACTIVIDAD = {'ACTIVIDAD','ITEM','ÍTEM','APU','ANALISIS','ANÁLISIS'}
-    TIPOS_SECCION = {
-        'mano_de_obra': ['CUADRILLA','MANO DE OBRA','MO','PERSONAL','JORNAL','OPERARIO','OBRERO'],
-        'herramientas': ['EQUIPO','EQUIPOS','HERRAMIENTA','HERRAMIENTAS','MAQUINARIA'],
-        'transporte':   ['TRANSPORTE','FLETE','ACARREO','MOVILIZACION','MOVILIZACIÓN'],
-        'materiales':   ['INSUMO','INSUMOS','MATERIAL','MATERIALES','ANALISIS BASICO',
-                         'ANÁLISIS BÁSICO','ENSAYO','SUBCONTRATO','OTRO'],
-    }
-
-    def _n(s):
-        t = str(s).upper().strip()
-        t = ''.join(c for c in unicodedata.normalize('NFD',t) if unicodedata.category(c)!='Mn')
-        return _re.sub(r'\s+',' ',t)
-
-    def _score(header, syns):
-        h = _n(header)
-        for s in syns:
-            sn = _n(s)
-            if h == sn:      return 3
-            if sn in h:      return 2
-            if h in sn and len(h) >= 4: return 1
-        return 0
-
-    def _clasificar(tipo_val):
-        t = _n(tipo_val)
-        for sec, words in TIPOS_SECCION.items():
-            for w in words:
-                wn = _n(w)
-                if wn == t: return sec
-                if len(wn) >= 3 and _re.search(r''+_re.escape(wn)+r'', t):
-                    return sec
-        return 'materiales'
-
-    def _es_actividad(tipo_val):
-        t = _n(tipo_val)
-        return any(_n(x) in t or t in _n(x) for x in TIPOS_ACTIVIDAD)
-
-    # ── Detectar fila de encabezados ──────────────────────────────────────
-    mejor_fila = 0; mejor_score = 0; mejor_mapa = {}; mejor_enc = []
-    for fi in range(min(10, ws_apu.max_row)):
-        fila = [c.value for c in ws_apu[fi+1]]
-        if not any(fila): continue
-        asignado = {}; mapa = {}; total_s = 0
-        for campo, syns in SINONIMOS.items():
-            col_scores = {ci: _score(str(cel),syns) for ci,cel in enumerate(fila)
-                          if cel and _score(str(cel),syns) > 0 and ci not in asignado}
-            if not col_scores: continue
-            best_col = max(col_scores, key=col_scores.get)
-            mapa[campo] = best_col
-            asignado[best_col] = campo
-            total_s += col_scores[best_col]
-        if total_s > mejor_score:
-            mejor_score=total_s; mejor_fila=fi; mejor_mapa=mapa
-            mejor_enc=[str(c) if c else '' for c in fila]
-
-    # Confianza mínima
-    criticos = {'col_codigo','col_desc','col_rend','col_unit','col_total'}
-    if len(criticos & set(mejor_mapa)) < 2:
-        return {}   # formato no reconocido
-
-    i_cod  = mejor_mapa.get('col_codigo')
-    i_cins = mejor_mapa.get('col_codins')
-    i_desc = mejor_mapa.get('col_desc')
-    i_tipo = mejor_mapa.get('col_tipo')
-    i_und  = mejor_mapa.get('col_und')
-    i_rend = mejor_mapa.get('col_rend')
-    i_unit = mejor_mapa.get('col_unit')
-    i_parc = mejor_mapa.get('col_parcial')
-    i_tot  = mejor_mapa.get('col_total')
-
-    def _get(row, idx):
-        return row[idx] if (idx is not None and idx < len(row)) else None
-
-    # ── Detectar variante ─────────────────────────────────────────────────
-    tipos_muestra = set()
-    codins_muestra = set()
-    for row in ws_apu.iter_rows(min_row=mejor_fila+2, max_row=mejor_fila+22, values_only=True):
-        v = _get(row, i_tipo)
-        if v: tipos_muestra.add(_n(str(v)))
-        v2 = _get(row, i_cins)
-        if v2: codins_muestra.add(str(v2).strip())
-
-    tipos_conocidos = TIPOS_ACTIVIDAD | {_n(t) for lst in TIPOS_SECCION.values() for t in lst}
-    if tipos_muestra & tipos_conocidos:
-        variante = 'tipo_columna'
-    elif '-' in codins_muestra:
-        variante = 'codins_marca'
-    else:
-        variante = 'desconocido'
-
-    # ── Leer filas ────────────────────────────────────────────────────────
-    bd = {}; current = None
-    for row in ws_apu.iter_rows(min_row=mejor_fila+2, values_only=True):
-        if not any(row): continue
-        cod_v  = _get(row, i_cod)
-        codins = str(_get(row, i_cins) or '').strip()
-        desc   = str(_get(row, i_desc) or '').strip()
-        tipo_v = str(_get(row, i_tipo) or '').strip()
-        und    = str(_get(row, i_und)  or '').strip()
-        rend   = _get(row, i_rend)
-        unit   = _get(row, i_unit)
-        parc   = _get(row, i_parc)
-        total  = _get(row, i_tot)
-        cod_s  = str(cod_v).strip() if cod_v else ''
-
-        es_act = False
-        if variante == 'tipo_columna':
-            es_act = bool(tipo_v) and _es_actividad(tipo_v) and codins == '-'
-        elif variante == 'codins_marca':
-            es_act = codins == '-'
-        else:
-            es_act = (isinstance(total,(int,float)) and total > 0
-                      and not isinstance(rend,(int,float))
-                      and not isinstance(unit,(int,float)) and bool(cod_s))
-
-        if es_act and cod_s:
-            current = cod_s
-            bd[current] = {
-                'total_referencia': float(total) if isinstance(total,(int,float)) else 0,
-                'descripcion': desc,
-                'materiales':[],'herramientas':[],'transporte':[],'mano_de_obra':[],
-            }
-            continue
-
-        if not current: continue
-        if not isinstance(rend,(int,float)) or not isinstance(unit,(int,float)): continue
-        if rend == 0 and unit == 0: continue
-
-        parc_v = float(parc) if isinstance(parc,(int,float)) else round(float(rend)*float(unit),0)
-        comp = {'description':desc,'unit':und,'rend':float(rend),'unit_price':float(unit),
-                'parcial':parc_v,'_rend_ajustado':False}
-
-        if tipo_v:
-            sec = _clasificar(tipo_v)
-        else:
-            d = _n(desc)
-            if any(x in d for x in ('CUADRILLA','JORNAL','OFICIAL','AYUDANTE')):
-                sec = 'mano_de_obra'
-            elif any(x in d for x in ('EQUIPO','MAQUINARIA','HERRAMIENTA')):
-                sec = 'herramientas'
-            elif any(x in d for x in ('TRANSPORTE','FLETE','ACARREO')):
-                sec = 'transporte'
+    """Lee hoja APU en formato columnar estándar (CODINS='-')."""
+    bd = {}
+    current = None
+    primera = [c.value for c in ws_apu[1]]
+    fila_ini = 2 if any(v and 'CODIGO' in str(v).upper() for v in primera if v) else 1
+    for row in ws_apu.iter_rows(min_row=fila_ini, values_only=True):
+        if not row[0]: continue
+        code   = str(row[0]).strip()
+        codins = str(row[1]).strip() if row[1] is not None else ''
+        insumo = str(row[2]).strip() if row[2] else ''
+        tipo   = str(row[3]).strip() if row[3] else ''
+        unit   = str(row[4]).strip() if row[4] else ''
+        rend   = row[5]; uprice = row[6]; total = row[8]
+        if not tipo: continue
+        if codins == '-':
+            current = code
+            bd[code] = {'total_referencia': float(total) if total else 0,
+                        'materiales':[],'herramientas':[],'transporte':[],'mano_de_obra':[]}
+        elif current and code == current and rend is not None and uprice is not None:
+            comp = {'description': insumo, 'unit': unit,
+                    'rend': float(rend), 'unit_price': float(uprice)}
+            t = tipo.lower()
+            if any(x in t for x in ('insumo','analisis basico','actividad','ensayo')):
+                bd[current]['materiales'].append(comp)
+            elif any(x in t for x in ('herramienta','equipo')):
+                bd[current]['herramientas'].append(comp)
+            elif any(x in t for x in ('cuadrilla','personal')):
+                bd[current]['mano_de_obra'].append(comp)
+            elif 'transporte' in t:
+                bd[current]['transporte'].append(comp)
             else:
-                sec = 'materiales'
-        bd[current][sec].append(comp)
-
+                bd[current]['materiales'].append(comp)
     return bd
 
 def _construir_mapa_codigos(wb):
@@ -573,13 +441,13 @@ def leer_oferta_economica(uploaded_file, bd_referencia=None):
             continue
 
         ofrecido = item['valor_ofrecido']
+        delta    = ofrecido - ref          # positivo: ofrece más; negativo: ofrece menos
 
-        # Copiar componentes de referencia — precios unitarios intactos (tarifas oficiales)
+        # Copiar componentes de referencia (UNITARIO intacto — tarifa oficial)
         for sec in ('materiales', 'herramientas', 'transporte', 'mano_de_obra'):
             item[sec] = [dict(c) for c in apu[sec]]
-            for c in item[sec]:
-                c['_rend_ajustado'] = False   # marca de trazabilidad
 
+        # Calcular totales por sección
         def _total_sec(comps):
             return sum(c['rend'] * c['unit_price'] for c in comps
                        if c['unit_price'] > 0 and c['rend'] > 0)
@@ -587,66 +455,47 @@ def leer_oferta_economica(uploaded_file, bd_referencia=None):
         mo_ref    = _total_sec(item['mano_de_obra'])
         equip_ref = _total_sec(item['herramientas']) + _total_sec(item['transporte'])
         mat_ref   = _total_sec(item['materiales'])
-        total_ref = mo_ref + equip_ref + mat_ref
 
-        # Si el precio ofrecido ya cuadra con la referencia (tolerancia $1), no tocar nada
-        if abs(ofrecido - total_ref) <= 1:
-            for sec in ('materiales', 'herramientas', 'transporte', 'mano_de_obra'):
-                for c in item[sec]:
-                    c['parcial'] = round(c['rend'] * c['unit_price'], 0)
-            item['tiene_apu'] = True
-            continue
+        delta_restante = delta
 
-        delta_restante = ofrecido - total_ref
+        # ── Regla 1: ajustar REND de mano de obra primero ────────────────────
+        if mo_ref > 0 and delta_restante != 0:
+            mo_nuevo = mo_ref + delta_restante
+            mo_min   = mo_ref * 0.30   # mínimo: 30% del rendimiento original
+            mo_max   = mo_ref * 2.50   # máximo: 250% del rendimiento original
+            mo_nuevo = max(mo_min, min(mo_max, mo_nuevo))
+            factor_mo = mo_nuevo / mo_ref
+            for c in item['mano_de_obra']:
+                if c['unit_price'] > 0 and c['rend'] > 0:
+                    c['rend'] = round(c['rend'] * factor_mo, 6)
+            delta_restante -= (mo_nuevo - mo_ref)
 
-        # ── PASO 1: ajustar RENDIMIENTO de mano de obra (columna F) ──────────
-        # Regla: modificar solo el rendimiento, nunca el valor unitario (tarifa oficial).
-        # Límites técnicos: mín 20% del original, máx 300% del original.
-        if mo_ref > 0:
-            mo_objetivo = mo_ref + delta_restante
-            mo_min      = mo_ref * 0.20
-            mo_max      = mo_ref * 3.00
-            mo_ajustado = max(mo_min, min(mo_max, mo_objetivo))
-            factor_mo   = mo_ajustado / mo_ref
-            if abs(factor_mo - 1.0) > 0.0001:   # solo si hay cambio real
-                for c in item['mano_de_obra']:
-                    if c['unit_price'] > 0 and c['rend'] > 0:
-                        c['rend']           = round(c['rend'] * factor_mo, 6)
-                        c['_rend_ajustado'] = True
-            delta_restante -= (mo_ajustado - mo_ref)
-
-        # ── PASO 2: si queda diferencia, ajustar RENDIMIENTO de herramienta ──
-        # Solo si el delta residual supera $1 (diferencia real, no redondeo).
+        # ── Regla 2: si queda diferencia, ajustar REND de equipos/herramienta ─
         if equip_ref > 0 and abs(delta_restante) > 1:
-            equip_objetivo = equip_ref + delta_restante
-            equip_min      = equip_ref * 0.20
-            equip_max      = equip_ref * 3.00
-            equip_ajustado = max(equip_min, min(equip_max, equip_objetivo))
-            factor_eq      = equip_ajustado / equip_ref
-            if abs(factor_eq - 1.0) > 0.0001:
-                for sec in ('herramientas', 'transporte'):
-                    for c in item[sec]:
-                        if c['unit_price'] > 0 and c['rend'] > 0:
-                            c['rend']           = round(c['rend'] * factor_eq, 6)
-                            c['_rend_ajustado'] = True
-            delta_restante -= (equip_ajustado - equip_ref)
+            equip_nuevo = equip_ref + delta_restante
+            equip_min   = equip_ref * 0.20
+            equip_max   = equip_ref * 3.00
+            equip_nuevo = max(equip_min, min(equip_max, equip_nuevo))
+            factor_eq   = equip_nuevo / equip_ref
+            for sec in ('herramientas', 'transporte'):
+                for c in item[sec]:
+                    if c['unit_price'] > 0 and c['rend'] > 0:
+                        c['rend'] = round(c['rend'] * factor_eq, 6)
+            delta_restante -= (equip_nuevo - equip_ref)
 
-        # ── PASO 3 (último recurso): ajustar VALOR UNITARIO de insumos ───────
-        # Solo si todavía queda diferencia > $1 después de MO y equipos.
-        # Se ajusta el precio unitario (columna G), no el rendimiento.
-        # Límites: mín 60% del original, máx 160% del original.
+        # ── Regla 3 (último recurso): ajustar UNITARIO de materiales ─────────
         if mat_ref > 0 and abs(delta_restante) > 1:
-            mat_objetivo = mat_ref + delta_restante
-            mat_min      = mat_ref * 0.60
-            mat_max      = mat_ref * 1.60
-            mat_ajustado = max(mat_min, min(mat_max, mat_objetivo))
-            factor_mat   = mat_ajustado / mat_ref
+            mat_nuevo = mat_ref + delta_restante
+            mat_min   = mat_ref * 0.60
+            mat_max   = mat_ref * 1.60
+            mat_nuevo = max(mat_min, min(mat_max, mat_nuevo))
+            factor_mat = mat_nuevo / mat_ref
             for c in item['materiales']:
                 if c['unit_price'] > 0 and c['rend'] > 0:
-                    c['unit_price']     = max(1, int(round(c['unit_price'] * factor_mat, 0)))
-                    c['_rend_ajustado'] = True   # marca: este componente fue tocado
+                    # Para materiales: ajustar UNITARIO (precio de mercado)
+                    c['unit_price'] = max(1, int(round(c['unit_price'] * factor_mat, 0)))
 
-        # ── Recalcular parciales finales ──────────────────────────────────────
+        # Recalcular parciales con los valores finales
         for sec in ('materiales', 'herramientas', 'transporte', 'mano_de_obra'):
             for c in item[sec]:
                 c['parcial'] = round(c['rend'] * c['unit_price'], 0)
@@ -795,13 +644,9 @@ def _build_apu_sheet(ws, item, include_aiu=False, aiu_pct=0.0):
             if comp:
                 ws[f'A{r}'] = comp['description']
                 ws[f'E{r}'] = comp['unit'] if comp.get('unit') else ''
-                ws[f'F{r}'] = round(comp['rend'], 4)
-                ws[f'G{r}'] = int(round(comp['unit_price'], 0))
-                # Regla crítica: fila ajustada → =F*G sin redondeo; intacta → =ROUND(F*G,0)
-                if comp.get('_rend_ajustado'):
-                    ws[f'H{r}'] = f'=F{r}*G{r}'
-                else:
-                    ws[f'H{r}'] = f'=ROUND(F{r}*G{r},0)' 
+                ws[f'F{r}'] = round(comp['rend'], 4)          # rendimiento: hasta 4 decimales
+                ws[f'G{r}'] = int(round(comp['unit_price'], 0))  # VR UNIT: 0 decimales
+                ws[f'H{r}'] = f'=ROUND(F{r}*G{r},0)'
             for col, al, fmt in [
                 ('A',left_w,None),('E',center,None),
                 ('F',right,'#,##0.0000'),('G',right,CUR),('H',right,CUR)]:
